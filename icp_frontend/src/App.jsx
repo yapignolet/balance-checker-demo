@@ -5,7 +5,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
 import { sha256 } from 'js-sha256';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck, Send, CheckCircle, Repeat, XCircle } from 'lucide-react';
+import { Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck, Send, CheckCircle, Repeat, XCircle, Check } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Actor, HttpAgent } from '@dfinity/agent';
@@ -35,6 +35,13 @@ function formatCHError(err) {
   return typeof value === 'string' ? value : `${variant}: ${JSON.stringify(value)}`;
 }
 
+// Address validation helper
+function isValidAddress(addr, chain) {
+  if (!addr) return null;
+  if (chain === 'ethereum') return /^0x[a-fA-F0-9]{40}$/.test(addr);
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
+}
+
 const erc20Abi = parseAbi([
   'function balanceOf(address owner) view returns (uint256)',
   'function decimals() view returns (uint8)',
@@ -47,7 +54,6 @@ const CHAINS = [
 ];
 
 const TABS = [
-  { id: 'connect', name: 'Connect', icon: Key },
   { id: 'transfer', name: 'Transfer', icon: Send },
   { id: 'swap', name: 'Swap', icon: Repeat },
   { id: 'orders', name: 'Orders', icon: RefreshCw }
@@ -62,6 +68,11 @@ const INTENT_ASSETS = [
   { chain: 'solana', symbol: 'USDC', label: 'SOL USDC' },
   { chain: 'solana', symbol: 'EURC', label: 'SOL EURC' }
 ];
+
+const CHAIN_ICONS = {
+  ethereum: 'https://cryptologos.cc/logos/ethereum-eth-logo.svg?v=026',
+  solana: 'https://cryptologos.cc/logos/solana-sol-logo.svg?v=026'
+};
 
 // Serialize intent for signing - must match Rust serialize_intent_for_signing
 function serializeIntentForSigning(principal, sourceChain, sourceSymbol, destChain, destSymbol, amount, minOutput, sequenceNumber, destAddress) {
@@ -119,7 +130,7 @@ function encodeSecp256k1PublicKeyDer(privateKey) {
 }
 
 export default function App() {
-  const [selectedTab, setSelectedTab] = useState('connect');
+  const [selectedTab, setSelectedTab] = useState('transfer');
   const [inputValue, setInputValue] = useState('Alice');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -251,7 +262,9 @@ export default function App() {
       setIntentResult(null);
       const seedBytes = new Uint8Array(sha256.array(inputValue));
       const icpId = Secp256k1KeyIdentity.fromSecretKey(seedBytes);
-      const principal = icpId.getPrincipal().toText();
+      const principal = icpId.getPrincipal();
+      const principalText = principal.toText();
+
       const agent = new HttpAgent({ identity: icpId, host: "https://ic0.app" });
       const ethCanisterId = config.chains['sepolia'].canisterId;
       const solCanisterId = config.chains['solana-devnet'].canisterId;
@@ -259,25 +272,45 @@ export default function App() {
       const ethActorInstance = Actor.createActor(ethTransferIdl, { agent, canisterId: ethCanisterId });
       const solActorInstance = Actor.createActor(solTransferIdl, { agent, canisterId: solCanisterId });
       const matchingActorInstance = Actor.createActor(matchingEngineIdl, { agent, canisterId: matchingCanisterId });
+
       setIdentity(icpId);
       setEthActor(ethActorInstance);
       setSolActor(solActorInstance);
       setMatchingActor(matchingActorInstance);
-      const [ethRes, solRes] = await Promise.all([
-        ethActorInstance.get_eth_address(icpId.getPrincipal()),
-        solActorInstance.get_sol_address(icpId.getPrincipal())
-      ]);
-      if (ethRes && 'Ok' in ethRes && solRes && 'Ok' in solRes) {
-        const ethAddress = ethRes.Ok;
-        const solAddress = solRes.Ok;
-        setDerivedInfo({ principal, ethAddress, solAddress, seed: inputValue });
-        // Auto-fill intent destination with Solana address (default dest is Solana)
-        setIntentDestAddress(solAddress);
-        checkBalances([ethAddress, solAddress]);
+
+      // Check cache
+      const cacheKey = `address_cache_${inputValue}`;
+      const cached = localStorage.getItem(cacheKey);
+      let ethAddress, solAddress;
+
+      if (cached) {
+        const data = JSON.parse(cached);
+        ethAddress = data.ethAddress;
+        solAddress = data.solAddress;
+        console.log("Using cached addresses for", inputValue);
       } else {
-        console.error("Failed to fetch addresses:", { ethRes, solRes });
-        setLoading(false);
+        const [ethRes, solRes] = await Promise.all([
+          ethActorInstance.get_eth_address(principal),
+          solActorInstance.get_sol_address(principal)
+        ]);
+
+        if (ethRes && 'Ok' in ethRes && solRes && 'Ok' in solRes) {
+          ethAddress = ethRes.Ok;
+          solAddress = solRes.Ok;
+          // Store in cache
+          localStorage.setItem(cacheKey, JSON.stringify({ ethAddress, solAddress }));
+        } else {
+          console.error("Failed to fetch addresses:", { ethRes, solRes });
+          setLoading(false);
+          return;
+        }
       }
+
+      setDerivedInfo({ principal: principalText, ethAddress, solAddress, seed: inputValue });
+      // Auto-fill intent destination with Solana address (default dest is Solana)
+      setIntentDestAddress(solAddress);
+      checkBalances([ethAddress, solAddress]);
+
     } catch (e) { console.error("Derivation error:", e); setLoading(false); }
   }, [inputValue, checkBalances]);
 
@@ -526,342 +559,361 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 font-sans">
       <div className="w-full max-w-2xl space-y-6">
-        {/* Profile Selector */}
-        {/* Tab Selector */}
-        <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-2xl overflow-hidden p-2 flex bg-slate-900/40">
-          {TABS.map((tab) => (
-            <button key={tab.id} onClick={() => setSelectedTab(tab.id)}
-              className={cn("flex-1 flex items-center justify-center gap-2 py-3 rounded-2xl transition-all font-medium text-sm",
-                selectedTab === tab.id ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/25" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800")}>
-              <tab.icon className="w-4 h-4" />
-              {tab.name}
-            </button>
-          ))}
+        {/* Connection Header */}
+        <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden">
+          <div className="p-8 space-y-6">
+            <div className="flex justify-between items-baseline mb-1">
+              <label className="text-xs text-slate-400 font-bold uppercase">Identity Seed</label>
+            </div>
+            <div className="relative">
+              <input type="text" value={inputValue} onChange={(e) => {
+                setInputValue(e.target.value);
+                setDerivedInfo(null);
+                setResults([]);
+                setIdentity(null);
+              }}
+                placeholder="e.g. Alice"
+                className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-slate-200"
+                onKeyDown={(e) => e.key === 'Enter' && handleSeedDerivation()} />
+              <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-indigo-400" />
+              <button onClick={handleSeedDerivation} disabled={loading || !inputValue}
+                className={cn("absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-xl transition-all disabled:opacity-50",
+                  derivedInfo?.seed === inputValue ? "bg-green-600/20 text-green-400 border border-green-500/30" : "bg-indigo-600 hover:bg-indigo-500 text-white")}>
+                {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> :
+                  (derivedInfo?.seed === inputValue ? <Check className="w-5 h-5" /> : <ArrowRight className="w-5 h-5" />)}
+              </button>
+            </div>
+
+
+          </div>
         </div>
 
-        {/* Main Content */}
-        <motion.div layout className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden">
-          <AnimatePresence mode="popLayout" initial={false}>
-            {selectedTab === 'orders' && (
-              <motion.div key="orders" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-lg font-bold text-slate-200 flex items-center gap-2"><RefreshCw className="w-5 h-5" /> My Orders</h3>
-                    <button onClick={fetchOrders} className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"><RefreshCw className="w-4 h-4" /></button>
-                  </div>
-                  {orders.length === 0 ? (
-                    <p className="text-slate-500 text-center py-8">No orders found.</p>
-                  ) : (
-                    <div className="space-y-3">
-                      {orders.map(order => {
-                        const statusKey = Object.keys(order.status)[0];
-                        const isLocked = statusKey === 'Locked';
-                        return (
-                          <div key={order.id.toString()} className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 flex items-center justify-between">
-                            <div>
-                              <div className="text-sm text-slate-300 font-mono">Order #{order.id.toString()}</div>
-                              <div className="text-xs text-slate-500 flex gap-2 mt-1">
-                                <span>{Number(order.intent.amount) / 1e6} {Object.keys(order.intent.source_asset.chain)[0]}:{Object.keys(order.intent.source_asset.symbol)[0]}</span>
-                                <ArrowRight className="w-3 h-3" />
-                                <span>{Object.keys(order.intent.dest_asset.chain)[0]}:{Object.keys(order.intent.dest_asset.symbol)[0]}</span>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <span className={cn("text-xs px-2 py-1 rounded border",
-                                statusKey === 'Settled' ? "bg-green-500/10 text-green-400 border-green-500/20" :
-                                  statusKey === 'Cancelled' ? "bg-red-500/10 text-red-400 border-red-500/20" :
-                                    "bg-blue-500/10 text-blue-400 border-blue-500/20")}>
-                                {statusKey}
-                              </span>
-                              {isLocked && (
-                                <button onClick={() => handleCancelOrder(order.id)} className="p-2 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors" title="Cancel Order">
-                                  <XCircle className="w-4 h-4" />
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </motion.div>
-            )}
-
-            {selectedTab === 'connect' && (
-              <motion.div key="connect" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}>
-                <div className="p-8 border-b border-slate-700/50">
-                  <div className="relative">
-                    <input type="text" value={inputValue} onChange={(e) => setInputValue(e.target.value)}
-                      placeholder="Enter a seed string (e.g. Alice)..."
-                      className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-slate-200"
-                      onKeyDown={(e) => e.key === 'Enter' && handleSeedDerivation()} />
-                    <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-indigo-400" />
-                    <button onClick={handleSeedDerivation} disabled={loading || !inputValue}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50">
-                      {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
-                    </button>
-                  </div>
-
-                  {derivedInfo && (
-                    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mt-6 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-3">
-                      <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider">
-                        <ShieldCheck className="w-4 h-4" /> Deterministic Identity for "{derivedInfo.seed}"
-                      </div>
-                      <div className="flex flex-col">
-                        <span className="text-[10px] text-slate-500 font-bold uppercase">ICP Principal</span>
-                        <span className="text-xs font-mono text-slate-300 truncate">{derivedInfo.principal}</span>
-                      </div>
-                    </motion.div>
-                  )}
-                </div>
-
-                {/* Results List */}
-                <div className="p-8 space-y-8">
-                  {loading && results.length === 0 && (
-                    <div className="flex flex-col items-center justify-center py-10 text-slate-500 space-y-4">
-                      <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" /><p>Fetching balances...</p>
-                    </div>
-                  )}
-                  <AnimatePresence mode="popLayout">
-                    {results.map((res, idx) => (
-                      <motion.div key={res.address} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.1 }} className="space-y-4">
-                        <div className="flex items-center justify-between pb-2 border-b border-slate-700/30">
-                          <div className="flex items-center gap-3">
-                            <div className={cn("w-2 h-2 rounded-full ring-4 ring-opacity-20", res.chainType === 'ethereum' ? 'bg-blue-400 ring-blue-400' : res.chainType === 'solana' ? 'bg-purple-400 ring-purple-400' : 'bg-slate-500 ring-slate-500')} />
-                            <div>
-                              <p className="text-sm font-mono text-slate-300 break-all">{res.address}</p>
-                              <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">{res.chainType === 'ethereum' ? 'Ethereum Sepolia' : res.chainType === 'solana' ? 'Solana Devnet' : 'Unknown Chain'}</p>
-                            </div>
-                          </div>
-                          <a href={res.chainType === 'ethereum' ? `https://sepolia.etherscan.io/address/${res.address}` : `https://explorer.solana.com/address/${res.address}?cluster=devnet`}
-                            target="_blank" rel="noopener noreferrer" className="p-2 hover:bg-slate-700/50 rounded-lg text-slate-400 hover:text-indigo-400 transition-colors">
-                            <ExternalLink className="w-4 h-4" />
-                          </a>
+        {derivedInfo && (
+          <div className="space-y-6">
+            {/* Persistent Balances Dashboard */}
+            <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-lg overflow-hidden p-6">
+              <div className="flex items-center justify-between mb-4 px-2">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Balances</h3>
+                <button onClick={() => checkBalances([derivedInfo.ethAddress, derivedInfo.solAddress])} disabled={loading} className="text-indigo-400 hover:text-white transition-colors flex items-center gap-2 text-[10px] font-bold uppercase">
+                  <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} /> {loading ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {['ethereum', 'solana'].map(chain => {
+                  const res = results.find(r => r.chainType === chain);
+                  if (!res) return null;
+                  return (
+                    <div key={chain} className="space-y-3">
+                      <div className="flex items-center justify-between px-1">
+                        <div className="flex items-center gap-2">
+                          <img src={CHAIN_ICONS[chain]} className="w-4 h-4" alt={chain} />
+                          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tight">
+                            {chain === 'ethereum' ? 'Sepolia' : 'Devnet'}
+                          </span>
                         </div>
-                        {res.error ? (
-                          <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-sm flex items-center gap-2"><AlertCircle className="w-4 h-4" /> {res.error}</div>
-                        ) : (
-                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {res.balances.map((bal) => (
-                              <div key={bal.symbol} className="bg-slate-900/40 border border-slate-700/30 p-4 rounded-xl flex items-center justify-between">
-                                <div className="flex items-center gap-3">
-                                  <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs", bal.isNative ? "bg-indigo-500/20 text-indigo-400" : "bg-slate-800 text-slate-400")}>{bal.symbol[0]}</div>
-                                  <span className="font-bold text-slate-200">{bal.symbol}</span>
-                                </div>
-                                <span className="font-mono text-slate-300">{parseFloat(bal.amount).toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
-                              </div>
-                            ))}
+                        <a href={res.chainType === 'ethereum' ? `https://sepolia.etherscan.io/address/${res.address}` : `https://explorer.solana.com/address/${res.address}?cluster=devnet`}
+                          target="_blank" rel="noreferrer" className="text-slate-500 hover:text-indigo-400 transition-colors">
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        {res.balances.filter(b => b.symbol === 'USDC' || b.symbol === 'EURC').map(bal => (
+                          <div key={bal.symbol} className="bg-slate-900/40 border border-slate-700/30 p-3 rounded-xl flex items-center justify-between">
+                            <span className="text-[11px] font-bold text-slate-300">{bal.symbol}</span>
+                            <span className="text-sm font-mono text-white">{parseFloat(bal.amount).toFixed(6)}</span>
                           </div>
-                        )}
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
-
-                </div>
-              </motion.div>
-            )}
-
-            {selectedTab === 'transfer' && derivedInfo && identity && (
-              <motion.div key="transfer" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
-                <div className="bg-slate-900/50 p-6 rounded-2xl border border-indigo-500/30 space-y-4">
-                  <div className="flex items-center gap-2 text-indigo-400 text-sm font-bold uppercase tracking-wider">
-                    <Send className="w-4 h-4" /> Transfer Tokens
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-xs text-slate-500 font-bold uppercase">Chain</label>
-                      <select value={transferChain} onChange={(e) => { setTransferChain(e.target.value); setTransferToken(e.target.value === 'ethereum' ? 'ETH' : 'SOL'); }}
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
-                        {CHAINS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                      </select>
+                        ))}
+                      </div>
                     </div>
-                    <div>
-                      <label className="text-xs text-slate-500 font-bold uppercase">Token</label>
-                      <select value={transferToken} onChange={(e) => setTransferToken(e.target.value)}
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
-                        {currentChainTokens.map(t => <option key={t} value={t}>{t}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                  <div>
-                    <div className="flex justify-between">
-                      <label className="text-xs text-slate-500 font-bold uppercase">Amount</label>
-                      <button onClick={() => {
-                        const chainRes = results.find(r => r.chainType === transferChain);
-                        if (chainRes) {
-                          const bal = chainRes.balances.find(b => b.symbol === transferToken);
-                          if (bal) setTransferAmount(bal.amount);
-                        }
-                      }} className="text-xs text-indigo-400 hover:text-indigo-300 font-bold uppercase">Max</button>
-                    </div>
-                    <input type="text" value={transferAmount} onChange={(e) => setTransferAmount(e.target.value)} placeholder="0.01"
-                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
-                  </div>
-                  <div>
-                    <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
-                    <input type="text" value={transferDest} onChange={(e) => setTransferDest(e.target.value)} placeholder={transferChain === 'ethereum' ? '0x...' : 'Solana address...'}
-                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
-                  </div>
-                  <button onClick={handleTransfer} disabled={transferring || !transferAmount || !transferDest}
-                    className="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2">
-                    {transferring ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting...</> : <><Send className="w-5 h-5" /> Send Transfer</>}
-                  </button>
+                  );
+                })}
+              </div>
+              {!results.length && (
+                <div className="text-center py-4 text-slate-500 text-sm italic">Connect to fetch balances...</div>
+              )}
+            </div>
 
-                  {transferResult && (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-                      className={cn("p-4 rounded-xl flex items-center gap-3", transferResult.success ? "bg-green-500/10 border border-green-500/30" : "bg-red-500/10 border border-red-500/30")}>
-                      {transferResult.success ? (
-                        <>
-                          <CheckCircle className="w-5 h-5 text-green-400" />
-                          <div className="flex-1">
-                            <p className="text-green-400 font-medium">Transfer Submitted!</p>
-                            <a href={getExplorerTxUrl(transferResult.txHash, transferResult.chain)} target="_blank" rel="noopener noreferrer"
-                              className="text-xs font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 mt-1">
-                              {transferResult.txHash.slice(0, 20)}... <ExternalLink className="w-3 h-3" />
-                            </a>
-                          </div>
-                        </>
+            {/* Tab Selector */}
+            <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-2xl overflow-hidden p-2 flex bg-slate-900/40">
+              {TABS.map((tab) => (
+                <button key={tab.id} onClick={() => setSelectedTab(tab.id)}
+                  className={cn("flex-1 flex items-center justify-center gap-2 py-3 rounded-2xl transition-all font-medium text-sm",
+                    selectedTab === tab.id ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/25" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800")}>
+                  <tab.icon className="w-4 h-4" />
+                  {tab.name}
+                </button>
+              ))}
+            </div>
+
+            {/* Main Content Area */}
+            <motion.div layout className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden">
+              <AnimatePresence mode="popLayout" initial={false}>
+                {selectedTab === 'orders' && (
+                  <motion.div key="orders" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-lg font-bold text-slate-200 flex items-center gap-2"><RefreshCw className="w-5 h-5" /> My Orders</h3>
+                        <button onClick={fetchOrders} className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"><RefreshCw className="w-4 h-4" /></button>
+                      </div>
+                      {orders.length === 0 ? (
+                        <p className="text-slate-500 text-center py-8">No orders found.</p>
                       ) : (
-                        <>
-                          <AlertCircle className="w-5 h-5 text-red-400" />
-                          <p className="text-red-400">{transferResult.error}</p>
-                        </>
+                        <div className="space-y-3">
+                          {orders.map(order => {
+                            const statusKey = Object.keys(order.status)[0];
+                            const isLocked = statusKey === 'Locked';
+                            return (
+                              <div key={order.id.toString()} className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 flex items-center justify-between">
+                                <div>
+                                  <div className="text-sm text-slate-300 font-mono">Order #{order.id.toString()}</div>
+                                  <div className="text-xs text-slate-500 flex items-center gap-2 mt-1">
+                                    <span className="flex items-center gap-1">
+                                      {Number(order.intent.amount) / 1e6}
+                                      <img src={CHAIN_ICONS[Object.keys(order.intent.source_asset.chain)[0].toLowerCase()]} alt="chain" className="w-3 h-3" />
+                                      {Object.keys(order.intent.source_asset.symbol)[0]}
+                                    </span>
+                                    <ArrowRight className="w-3 h-3" />
+                                    <span className="flex items-center gap-1">
+                                      <img src={CHAIN_ICONS[Object.keys(order.intent.dest_asset.chain)[0].toLowerCase()]} alt="chain" className="w-3 h-3" />
+                                      {Object.keys(order.intent.dest_asset.symbol)[0]}
+                                    </span>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                  <span className={cn("text-xs px-2 py-1 rounded border",
+                                    statusKey === 'Settled' ? "bg-green-500/10 text-green-400 border-green-500/20" :
+                                      statusKey === 'Cancelled' ? "bg-red-500/10 text-red-400 border-red-500/20" :
+                                        "bg-blue-500/10 text-blue-400 border-blue-500/20")}>
+                                    {statusKey}
+                                  </span>
+                                  {isLocked && (
+                                    <button onClick={() => handleCancelOrder(order.id)} className="p-2 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors" title="Cancel Order">
+                                      <XCircle className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
-                    </motion.div>
-                  )}
-                </div>
-              </motion.div>
-            )}
+                    </div>
+                  </motion.div>
+                )}
 
-            {selectedTab === 'swap' && derivedInfo && identity && matchingActor && (
-              <motion.div key="swap" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
-                <div className="bg-slate-900/50 p-6 rounded-2xl border border-emerald-500/30 space-y-4">
-                  <div className="flex items-center gap-2 text-emerald-400 text-sm font-bold uppercase tracking-wider">
-                    <Repeat className="w-4 h-4" /> Submit Swap Intent
-                  </div>
-                  {(() => {
-                    const solRes = results.find(r => r.chainType === 'solana');
-                    const solBal = solRes?.balances.find(b => b.symbol === 'SOL')?.amount;
-                    if (solBal && parseFloat(solBal) < 0.002) {
-                      return (
-                        <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-xl flex items-center gap-3">
-                          <AlertCircle className="w-4 h-4 text-yellow-500" />
-                          <p className="text-yellow-500 text-xs">
-                            Your SOL balance is low ({parseFloat(solBal).toFixed(4)} SOL). You need SOL to pay for transaction fees.
-                          </p>
-                        </div>
-                      );
-                    }
-                    return null;
-                  })()}
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-xs text-slate-500 font-bold uppercase">Source Asset</label>
-                      <select value={intentSourceAsset} onChange={(e) => setIntentSourceAsset(e.target.value)}
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
-                        {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="text-xs text-slate-500 font-bold uppercase">Destination Asset</label>
-                      <select value={intentDestAsset} onChange={(e) => setIntentDestAsset(e.target.value)}
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
-                        {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <div className="flex justify-between">
-                        <label className="text-xs text-slate-500 font-bold uppercase">Amount (source)</label>
-                        <button onClick={() => {
-                          if (!intentSourceAsset) return;
-                          const [shouldBeChain, symbol] = intentSourceAsset.split(':');
-                          const chainType = shouldBeChain.toLowerCase();
-                          const chainRes = results.find(r => r.chainType === chainType);
-                          if (chainRes) {
-                            const bal = chainRes.balances.find(b => b.symbol === symbol);
-                            if (bal) setIntentAmount(bal.amount);
-                          }
-                        }} className="text-xs text-emerald-400 hover:text-emerald-300 font-bold uppercase">Max</button>
+                {selectedTab === 'transfer' && derivedInfo && identity && (
+                  <motion.div key="transfer" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                    <div className="bg-slate-900/50 p-6 rounded-2xl border border-indigo-500/30 space-y-4">
+                      <div className="flex items-center gap-2 text-indigo-400 text-sm font-bold uppercase tracking-wider">
+                        <Send className="w-4 h-4" /> Transfer Tokens
                       </div>
-                      <input type="text" value={intentAmount} onChange={(e) => setIntentAmount(e.target.value)} placeholder="100.00"
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
-                    </div>
-                    <div>
-                      <label className="text-xs text-slate-500 font-bold uppercase">Min Output</label>
-                      <input type="text" value={intentMinOutput} onChange={(e) => setIntentMinOutput(e.target.value)} placeholder="99.00 (optional)"
-                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
-                    <input type="text" value={intentDestAddress} onChange={(e) => setIntentDestAddress(e.target.value)} placeholder="Destination address..."
-                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
-                  </div>
-
-                  {/* Get Deposit Address Button */}
-                  <button onClick={handleGetDepositAddress} disabled={submittingIntent || !intentAmount || !intentDestAddress || !!depositAddress}
-                    className={cn("w-full py-3 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2",
-                      depositAddress ? "bg-slate-700 cursor-not-allowed opacity-75" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-500/20")}>
-                    {submittingIntent && !depositAddress ? <><RefreshCw className="w-5 h-5 animate-spin" /> Preparing Intent...</> :
-                      depositAddress ? <><CheckCircle className="w-5 h-5" /> Address Generated</> : <><Repeat className="w-5 h-5" /> Get Deposit Address</>}
-                  </button>
-
-                  {depositAddress && (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl space-y-4">
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 text-emerald-400 font-medium">
-                          <CheckCircle className="w-4 h-4" /> Deposit Address Ready
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-xs text-slate-500 font-bold uppercase">Chain</label>
+                          <select value={transferChain} onChange={(e) => { setTransferChain(e.target.value); setTransferToken(e.target.value === 'ethereum' ? 'ETH' : 'SOL'); }}
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+                            {CHAINS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                          </select>
                         </div>
-                        <div className="bg-black/30 p-2 rounded text-slate-200 font-mono text-xs break-all select-all border border-emerald-500/10">
-                          {depositAddress}
-                        </div>
-                        <div className="text-xs text-slate-400 text-center">
-                          Send <b>{intentAmount} {intentSourceAsset.split(':')[1]}</b> to this address.
+                        <div>
+                          <label className="text-xs text-slate-500 font-bold uppercase">Token</label>
+                          <select value={transferToken} onChange={(e) => setTransferToken(e.target.value)}
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+                            {currentChainTokens.map(t => <option key={t} value={t}>{t}</option>)}
+                          </select>
                         </div>
                       </div>
-
-                      <button onClick={handleDeposit} disabled={depositing || !!depositTx}
-                        className={cn("w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-bold shadow-lg",
-                          depositTx ? "bg-green-500/20 text-green-400 border border-green-500/30 cursor-default" : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/20")}>
-                        {depositing ? <RefreshCw className="w-4 h-4 animate-spin" /> :
-                          depositTx ? <><CheckCircle className="w-4 h-4" /> Deposit Executed</> :
-                            <><Send className="w-4 h-4" /> Execute Deposit</>}
+                      <div>
+                        <div className="flex justify-between">
+                          <label className="text-xs text-slate-500 font-bold uppercase">Amount</label>
+                          <button onClick={() => {
+                            const chainRes = results.find(r => r.chainType === transferChain);
+                            if (chainRes) {
+                              const bal = chainRes.balances.find(b => b.symbol === transferToken);
+                              if (bal) setTransferAmount(bal.amount);
+                            }
+                          }} className="text-xs text-indigo-400 hover:text-indigo-300 font-bold uppercase">Max</button>
+                        </div>
+                        <input type="text" value={transferAmount} onChange={(e) => setTransferAmount(e.target.value)} placeholder="0.01"
+                          className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
+                        <input type="text" value={transferDest} onChange={(e) => setTransferDest(e.target.value)} placeholder={transferChain === 'ethereum' ? '0x...' : 'Solana address...'}
+                          className={cn("w-full mt-1 bg-slate-900/50 border rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2",
+                            transferDest ? (isValidAddress(transferDest, transferChain) ? "border-green-500/50 focus:ring-green-500/50" : "border-red-500/50 focus:ring-red-500/50") : "border-slate-700 focus:ring-indigo-500/50")} />
+                      </div>
+                      <button onClick={handleTransfer} disabled={transferring || !transferAmount || !transferDest}
+                        className="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2">
+                        {transferring ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting...</> : <><Send className="w-5 h-5" /> Send Transfer</>}
                       </button>
 
-                      {depositTx && (
-                        <div className="space-y-4 pt-4 border-t border-white/10 mt-4">
-                          <div className="flex items-center justify-center gap-2 text-indigo-400 text-sm">
-                            <ExternalLink className="w-4 h-4" />
-                            <a href={getExplorerTxUrl(depositTx, intentSourceAsset.split(':')[0])} target="_blank" rel="noreferrer" className="underline hover:text-indigo-300">
-                              View Deposit Transaction
-                            </a>
+                      {transferResult && (
+                        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                          className={cn("p-4 rounded-xl flex items-center gap-3", transferResult.success ? "bg-green-500/10 border border-green-500/30" : "bg-red-500/10 border border-red-500/30")}>
+                          {transferResult.success ? (
+                            <>
+                              <CheckCircle className="w-5 h-5 text-green-400" />
+                              <div className="flex-1">
+                                <p className="text-green-400 font-medium">Transfer Submitted!</p>
+                                <a href={getExplorerTxUrl(transferResult.txHash, transferResult.chain)} target="_blank" rel="noopener noreferrer"
+                                  className="text-xs font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 mt-1">
+                                  {transferResult.txHash.slice(0, 20)}... <ExternalLink className="w-3 h-3" />
+                                </a>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="w-5 h-5 text-red-400" />
+                              <p className="text-red-400">{transferResult.error}</p>
+                            </>
+                          )}
+                        </motion.div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+
+                {selectedTab === 'swap' && derivedInfo && identity && matchingActor && (
+                  <motion.div key="swap" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                    <div className="bg-slate-900/50 p-6 rounded-2xl border border-emerald-500/30 space-y-4">
+                      <div className="flex items-center gap-2 text-emerald-400 text-sm font-bold uppercase tracking-wider">
+                        <Repeat className="w-4 h-4" /> Submit Swap Order
+                      </div>
+                      {(() => {
+                        const solRes = results.find(r => r.chainType === 'solana');
+                        const solBal = solRes?.balances.find(b => b.symbol === 'SOL')?.amount;
+                        if (solBal && parseFloat(solBal) < 0.002) {
+                          return (
+                            <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-xl flex items-center gap-3">
+                              <AlertCircle className="w-4 h-4 text-yellow-500" />
+                              <p className="text-yellow-500 text-xs">
+                                Your SOL balance is low ({parseFloat(solBal).toFixed(6)} SOL). You need SOL to pay for transaction fees.
+                              </p>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-xs text-slate-500 font-bold uppercase">Source Asset</label>
+                          <select value={intentSourceAsset} onChange={(e) => setIntentSourceAsset(e.target.value)}
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
+                            {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs text-slate-500 font-bold uppercase">Destination Asset</label>
+                          <select value={intentDestAsset} onChange={(e) => setIntentDestAsset(e.target.value)}
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
+                            {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <div className="flex justify-between items-center h-5">
+                            <label className="text-xs text-slate-500 font-bold uppercase">Amount (source)</label>
+                            <button onClick={() => {
+                              if (!intentSourceAsset) return;
+                              const [shouldBeChain, symbol] = intentSourceAsset.split(':');
+                              const chainType = shouldBeChain.toLowerCase();
+                              const chainRes = results.find(r => r.chainType === chainType);
+                              if (chainRes) {
+                                const bal = chainRes.balances.find(b => b.symbol === symbol);
+                                if (bal) setIntentAmount(bal.amount);
+                              }
+                            }} className="text-[10px] text-emerald-400 hover:text-emerald-300 font-bold uppercase bg-emerald-500/10 px-1.5 py-0.5 rounded">MAX</button>
+                          </div>
+                          <input type="text" value={intentAmount} onChange={(e) => setIntentAmount(e.target.value)} placeholder="100.00"
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
+                        </div>
+                        <div>
+                          <div className="flex items-center h-5">
+                            <label className="text-xs text-slate-500 font-bold uppercase">Min Output</label>
+                          </div>
+                          <input type="text" value={intentMinOutput} onChange={(e) => setIntentMinOutput(e.target.value)} placeholder="99.00 (optional)"
+                            className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
+                        </div>
+                      </div>
+                      <div>
+                        <div className="flex justify-between items-center mb-1">
+                          <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
+                          {derivedInfo && intentDestAddress === (intentDestAsset.split(':')[0] === 'ethereum' ? derivedInfo.ethAddress : derivedInfo.solAddress) && (
+                            <span className="text-[10px] text-emerald-500 font-bold uppercase flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" /> Auto-filled
+                            </span>
+                          )}
+                        </div>
+                        <input type="text" value={intentDestAddress} onChange={(e) => setIntentDestAddress(e.target.value)} placeholder="Destination address..."
+                          className={cn("w-full bg-slate-900/50 border rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2",
+                            intentDestAddress ? (isValidAddress(intentDestAddress, intentDestAsset.split(':')[0]) ? "border-green-500/50 focus:ring-green-500/50" : "border-red-500/50 focus:ring-red-500/50") : "border-slate-700 focus:ring-emerald-500/50")} />
+                      </div>
+
+                      {/* Get Deposit Address Button */}
+                      <button onClick={handleGetDepositAddress} disabled={submittingIntent || !intentAmount || !intentDestAddress || !!depositAddress}
+                        className={cn("w-full py-3 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2",
+                          depositAddress ? "bg-slate-700 cursor-not-allowed opacity-75" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-500/20")}>
+                        {submittingIntent && !depositAddress ? <><RefreshCw className="w-5 h-5 animate-spin" /> Preparing Intent...</> :
+                          depositAddress ? <><CheckCircle className="w-5 h-5" /> Address Generated</> : <><Repeat className="w-5 h-5" /> Get Deposit Address</>}
+                      </button>
+
+                      {depositAddress && (
+                        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl space-y-4">
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2 text-emerald-400 font-medium">
+                              <CheckCircle className="w-4 h-4" /> Deposit Address Ready
+                            </div>
+                            <div className="bg-black/30 p-2 rounded text-slate-200 font-mono text-xs break-all select-all border border-emerald-500/10">
+                              {depositAddress}
+                            </div>
+                            <div className="text-xs text-slate-400 text-center">
+                              Send <b>{intentAmount} {intentSourceAsset.split(':')[1]}</b> to this address.
+                            </div>
                           </div>
 
-                          <button onClick={handleFinalSubmitIntent} disabled={submittingIntent || (intentResult?.success && intentResult?.orderId)}
-                            className={cn("w-full py-3 text-white font-bold rounded-xl transition-all shadow-lg flex items-center justify-center gap-2",
-                              (intentResult?.success && intentResult?.orderId) ? "bg-green-600 shadow-green-500/20 cursor-default" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-500/20")}>
-                            {submittingIntent ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting Intent...</> :
-                              (intentResult?.success && intentResult?.orderId) ? <><CheckCircle className="w-5 h-5" /> Order submitted successfully</> : <><ShieldCheck className="w-5 h-5" /> Submit Final Intent</>}
+                          <button onClick={handleDeposit} disabled={depositing || !!depositTx}
+                            className={cn("w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-bold shadow-lg",
+                              depositTx ? "bg-green-500/20 text-green-400 border border-green-500/30 cursor-default" : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/20")}>
+                            {depositing ? <RefreshCw className="w-4 h-4 animate-spin" /> :
+                              depositTx ? <><CheckCircle className="w-4 h-4" /> Deposit Executed</> :
+                                <><Send className="w-4 h-4" /> Execute Deposit</>}
                           </button>
+
+                          {depositTx && (
+                            <div className="space-y-4 pt-4 border-t border-white/10 mt-4">
+                              <div className="flex items-center justify-center gap-2 text-indigo-400 text-sm">
+                                <ExternalLink className="w-4 h-4" />
+                                <a href={getExplorerTxUrl(depositTx, intentSourceAsset.split(':')[0])} target="_blank" rel="noreferrer" className="underline hover:text-indigo-300">
+                                  View Deposit Transaction
+                                </a>
+                              </div>
+
+                              <button onClick={handleFinalSubmitIntent} disabled={submittingIntent || (intentResult?.success && intentResult?.orderId)}
+                                className={cn("w-full py-3 text-white font-bold rounded-xl transition-all shadow-lg flex items-center justify-center gap-2",
+                                  (intentResult?.success && intentResult?.orderId) ? "bg-slate-800 text-slate-400 cursor-default" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-500/20")}>
+                                {submittingIntent ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting Order...</> :
+                                  (intentResult?.success && intentResult?.orderId) ? <><CheckCircle className="w-5 h-5" /> Order submitted successfully</> : <><ShieldCheck className="w-5 h-5" /> Submit Swap Order</>}
+                              </button>
+                            </div>
+                          )}
+                        </motion.div>
+                      )}
+
+                      {intentResult && !intentResult.success && (
+                        <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-xl flex items-center gap-3 mt-4">
+                          <AlertCircle className="w-5 h-5 text-red-400" />
+                          <p className="text-red-400 text-sm">{intentResult.error}</p>
                         </div>
                       )}
-                    </motion.div>
-                  )}
-
-                  {intentResult && !intentResult.success && (
-                    <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-xl flex items-center gap-3 mt-4">
-                      <AlertCircle className="w-5 h-5 text-red-400" />
-                      <p className="text-red-400 text-sm">{intentResult.error}</p>
                     </div>
-                  )}
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </motion.div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </motion.div>
+          </div>
+        )}
       </div>
     </div>
   );
