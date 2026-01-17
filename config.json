@@ -1,0 +1,43 @@
+{
+    "chains": {
+        "sepolia": {
+            "type": "evm",
+            "name": "Ethereum Sepolia Testnet",
+            "rpc": "https://ethereum-sepolia-rpc.publicnode.com",
+            "chainId": 11155111,
+            "nativeToken": {
+                "symbol": "ETH",
+                "decimals": 18
+            },
+            "tokens": {
+                "USDC": {
+                    "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+                    "decimals": 6
+                },
+                "EURC": {
+                    "address": "0x08210F9170F89Ab7658F0B5E3fF39b0E03C594D4",
+                    "decimals": 6
+                }
+            }
+        },
+        "solana-devnet": {
+            "type": "solana",
+            "name": "Solana Devnet",
+            "rpc": "https://api.devnet.solana.com",
+            "nativeToken": {
+                "symbol": "SOL",
+                "decimals": 9
+            },
+            "tokens": {
+                "USDC": {
+                    "address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+                    "decimals": 6
+                },
+                "EURC": {
+                    "address": "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+                    "decimals": 6
+                }
+            }
+        }
+    }
+}
