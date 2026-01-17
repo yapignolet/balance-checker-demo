@@ -1,4 +1,5 @@
 {
+    "matchingEngine": "bftcj-kqaaa-aaaar-qb3lq-cai",
     "chains": {
         "sepolia": {
             "type": "evm",

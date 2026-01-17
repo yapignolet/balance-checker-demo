@@ -1,16 +1,20 @@
 import { useState, useEffect, useCallback } from 'react';
-import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
+import { createPublicClient, createWalletClient, custom, http, formatUnits, parseAbi, encodeFunctionData } from 'viem';
 import { sepolia } from 'viem/chains';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
 import { sha256 } from 'js-sha256';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck, Send, CheckCircle } from 'lucide-react';
+import { Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck, Send, CheckCircle, Repeat, XCircle } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Actor, HttpAgent } from '@dfinity/agent';
-import { ethTransferIdl, solTransferIdl } from './idl';
+import { Principal } from '@dfinity/principal';
+import { ethTransferIdl, solTransferIdl, matchingEngineIdl } from './idl';
+import * as secp256k1 from '@noble/secp256k1';
 import config from './config.json';
+
+// Configure hmacSha256Sync and sha256Sync not needed for v1.7.1
 
 function cn(...inputs) {
   return twMerge(clsx(inputs));
@@ -37,20 +41,85 @@ const erc20Abi = parseAbi([
   'function symbol() view returns (string)'
 ]);
 
-const PROFILES = {
-  oisy: { id: 'oisy', name: 'Oisy', addresses: ['2LmLQpWuTfhmc1GkMxsBphZnC9zN4qPutGWoCQw9Kgbi', '0xd276501dBd43731C61ff775b21e80696c3c73645'] },
-  alice: { id: 'alice', name: 'Alice', addresses: ['8vJ1EEeJBSX8UZetuHY7d2SiGjdw2AhfamzfxokPsCF4', '0x78697a9cfc48C1e9d1040172d51833EF78083b10'] },
-  seed: { id: 'seed', name: 'Connect Seed', addresses: [] },
-  custom: { id: 'custom', name: 'Manual', addresses: [] }
-};
-
 const CHAINS = [
   { id: 'ethereum', name: 'Ethereum Sepolia', tokens: ['ETH', 'USDC', 'EURC'] },
   { id: 'solana', name: 'Solana Devnet', tokens: ['SOL', 'USDC', 'EURC'] }
 ];
 
+const TABS = [
+  { id: 'connect', name: 'Connect', icon: Key },
+  { id: 'transfer', name: 'Transfer', icon: Send },
+  { id: 'swap', name: 'Swap', icon: Repeat },
+  { id: 'orders', name: 'Orders', icon: RefreshCw }
+];
+
+// Intent-specific constants matching Rust serialization
+const CHAIN_IDS = { ethereum: 1, solana: 2 };
+const ASSET_IDS = { USDC: 1, EURC: 2 };
+const INTENT_ASSETS = [
+  { chain: 'ethereum', symbol: 'USDC', label: 'ETH USDC' },
+  { chain: 'ethereum', symbol: 'EURC', label: 'ETH EURC' },
+  { chain: 'solana', symbol: 'USDC', label: 'SOL USDC' },
+  { chain: 'solana', symbol: 'EURC', label: 'SOL EURC' }
+];
+
+// Serialize intent for signing - must match Rust serialize_intent_for_signing
+function serializeIntentForSigning(principal, sourceChain, sourceSymbol, destChain, destSymbol, amount, minOutput, sequenceNumber, destAddress) {
+  const parts = [];
+
+  // Principal bytes
+  const principalBytes = principal.toUint8Array();
+  parts.push(...principalBytes);
+
+  // Chain and asset IDs (1 byte each)
+  parts.push(CHAIN_IDS[sourceChain]);
+  parts.push(ASSET_IDS[sourceSymbol]);
+  parts.push(CHAIN_IDS[destChain]);
+  parts.push(ASSET_IDS[destSymbol]);
+
+  // amount (8 bytes, big endian)
+  const amountBuf = new ArrayBuffer(8);
+  new DataView(amountBuf).setBigUint64(0, BigInt(amount), false);
+  parts.push(...new Uint8Array(amountBuf));
+
+  // min_output (8 bytes, big endian)
+  const minOutputBuf = new ArrayBuffer(8);
+  new DataView(minOutputBuf).setBigUint64(0, BigInt(minOutput), false);
+  parts.push(...new Uint8Array(minOutputBuf));
+
+  // sequence_number (8 bytes, big endian)
+  const seqBuf = new ArrayBuffer(8);
+  new DataView(seqBuf).setBigUint64(0, BigInt(sequenceNumber), false);
+  parts.push(...new Uint8Array(seqBuf));
+
+  // dest_address (string bytes)
+  const encoder = new TextEncoder();
+  parts.push(...encoder.encode(destAddress));
+
+  return new Uint8Array(parts);
+}
+
+// Encode public key in DER/SPKI format for Secp256k1
+function encodeSecp256k1PublicKeyDer(privateKey) {
+  // SPKI header for secp256k1 (OID 1.2.840.10045.2.1 + 1.3.132.0.10)
+  const spkiHeader = new Uint8Array([
+    0x30, 0x56, // SEQUENCE, 86 bytes
+    0x30, 0x10, // SEQUENCE, 16 bytes (AlgorithmIdentifier)
+    0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID ecPublicKey
+    0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a, // OID secp256k1
+    0x03, 0x42, 0x00 // BIT STRING, 66 bytes, 0 unused bits
+  ]);
+  // Get uncompressed public key (65 bytes starting with 0x04)
+  const uncompressedPubKey = secp256k1.getPublicKey(privateKey, false);
+
+  const der = new Uint8Array(spkiHeader.length + uncompressedPubKey.length);
+  der.set(spkiHeader);
+  der.set(uncompressedPubKey, spkiHeader.length);
+  return der;
+}
+
 export default function App() {
-  const [selectedProfile, setSelectedProfile] = useState('seed');
+  const [selectedTab, setSelectedTab] = useState('connect');
   const [inputValue, setInputValue] = useState('Alice');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -58,6 +127,32 @@ export default function App() {
   const [identity, setIdentity] = useState(null);
   const [ethActor, setEthActor] = useState(null);
   const [solActor, setSolActor] = useState(null);
+  const [matchingActor, setMatchingActor] = useState(null);
+  const [orders, setOrders] = useState([]);
+
+  const fetchOrders = useCallback(async () => {
+    if (!matchingActor || !identity) return;
+    try {
+      const principal = identity.getPrincipal();
+      const pStr = principal.toString(); // or toText()
+      const allOrders = await matchingActor.list_orders();
+      // Filter by user
+      const myOrders = allOrders.filter(o => o.intent.user.toString() === pStr);
+      // Sort by ID desc
+      myOrders.sort((a, b) => Number(b.id) - Number(a.id));
+      setOrders(myOrders);
+    } catch (e) {
+      console.error("Error fetching orders:", e);
+    }
+  }, [matchingActor, identity]);
+
+  useEffect(() => {
+    if (selectedTab === 'orders') {
+      fetchOrders();
+      const interval = setInterval(fetchOrders, 5000); // Polling
+      return () => clearInterval(interval);
+    }
+  }, [selectedTab, fetchOrders]);
 
   // Transfer state
   const [transferChain, setTransferChain] = useState('ethereum');
@@ -66,6 +161,29 @@ export default function App() {
   const [transferDest, setTransferDest] = useState('');
   const [transferring, setTransferring] = useState(false);
   const [transferResult, setTransferResult] = useState(null);
+
+  // Intent submission state
+  const [intentSourceAsset, setIntentSourceAsset] = useState('ethereum:USDC');
+  const [intentDestAsset, setIntentDestAsset] = useState('solana:USDC');
+  const [intentAmount, setIntentAmount] = useState('');
+  const [intentMinOutput, setIntentMinOutput] = useState('');
+  const [intentDestAddress, setIntentDestAddress] = useState('');
+  const [submittingIntent, setSubmittingIntent] = useState(false);
+  const [intentResult, setIntentResult] = useState(null);
+  const [depositAddress, setDepositAddress] = useState(null);
+  const [signedIntent, setSignedIntent] = useState(null);
+  const [depositTx, setDepositTx] = useState(null);
+  const [depositing, setDepositing] = useState(false);
+  const [orderStatus, setOrderStatus] = useState(null);
+
+  // Reset intent result and deposit address when inputs change
+  useEffect(() => {
+    setIntentResult(null);
+    setDepositAddress(null);
+    setSignedIntent(null);
+    setDepositTx(null);
+    setOrderStatus(null);
+  }, [intentSourceAsset, intentDestAsset, intentAmount, intentMinOutput]);
 
   const fetchEthereumBalances = useCallback(async (addr) => {
     const chainConfig = config.chains['sepolia'];
@@ -130,17 +248,21 @@ export default function App() {
     try {
       setLoading(true);
       setTransferResult(null);
+      setIntentResult(null);
       const seedBytes = new Uint8Array(sha256.array(inputValue));
       const icpId = Secp256k1KeyIdentity.fromSecretKey(seedBytes);
       const principal = icpId.getPrincipal().toText();
       const agent = new HttpAgent({ identity: icpId, host: "https://ic0.app" });
       const ethCanisterId = config.chains['sepolia'].canisterId;
       const solCanisterId = config.chains['solana-devnet'].canisterId;
+      const matchingCanisterId = config.matchingEngine;
       const ethActorInstance = Actor.createActor(ethTransferIdl, { agent, canisterId: ethCanisterId });
       const solActorInstance = Actor.createActor(solTransferIdl, { agent, canisterId: solCanisterId });
+      const matchingActorInstance = Actor.createActor(matchingEngineIdl, { agent, canisterId: matchingCanisterId });
       setIdentity(icpId);
       setEthActor(ethActorInstance);
       setSolActor(solActorInstance);
+      setMatchingActor(matchingActorInstance);
       const [ethRes, solRes] = await Promise.all([
         ethActorInstance.get_eth_address(icpId.getPrincipal()),
         solActorInstance.get_sol_address(icpId.getPrincipal())
@@ -149,6 +271,8 @@ export default function App() {
         const ethAddress = ethRes.Ok;
         const solAddress = solRes.Ok;
         setDerivedInfo({ principal, ethAddress, solAddress, seed: inputValue });
+        // Auto-fill intent destination with Solana address (default dest is Solana)
+        setIntentDestAddress(solAddress);
         checkBalances([ethAddress, solAddress]);
       } else {
         console.error("Failed to fetch addresses:", { ethRes, solRes });
@@ -207,18 +331,190 @@ export default function App() {
     } finally { setTransferring(false); }
   }, [identity, transferAmount, transferDest, transferChain, transferToken, ethActor, solActor]);
 
-  useEffect(() => {
-    if (selectedProfile === 'oisy' || selectedProfile === 'alice') {
-      checkBalances(PROFILES[selectedProfile].addresses);
-      setDerivedInfo(null);
-      setIdentity(null);
-    } else {
-      setResults([]);
-      setDerivedInfo(null);
-    }
-  }, [selectedProfile, checkBalances]);
+  // Handle intent submission with signing
+  const handleGetDepositAddress = useCallback(async () => {
+    if (!identity || !matchingActor || !intentAmount || !intentDestAddress) return;
 
-  const handleManualSubmit = () => { if (inputValue) checkBalances([inputValue]); };
+    // Determine source actor
+    const [sChain] = intentSourceAsset.split(':');
+    const sourceActor = sChain === 'ethereum' ? ethActor : solActor;
+
+    if (!sourceActor) {
+      setIntentResult({ success: false, error: "Source chain actor not initialized" });
+      return;
+    }
+
+    setSubmittingIntent(true);
+    setIntentResult(null);
+    setDepositAddress(null);
+
+    try {
+      const principal = identity.getPrincipal();
+      const [sourceChain, sourceSymbol] = intentSourceAsset.split(':');
+      const [destChain, destSymbol] = intentDestAsset.split(':');
+
+      // Convert amounts to base units (6 decimals for stablecoins)
+      const amountBaseUnits = BigInt(Math.floor(parseFloat(intentAmount) * 1e6));
+      const minOutputBaseUnits = BigInt(Math.floor(parseFloat(intentMinOutput || intentAmount) * 1e6));
+
+      // Fetch sequence number from canister
+      const sequenceNumber = await matchingActor.get_next_sequence_number(principal);
+
+      // Get the private key from identity for signing
+      const keyPair = identity.getKeyPair();
+      const privateKey = keyPair.secretKey.slice(0, 32); // First 32 bytes is the private key
+      const publicKeyDer = encodeSecp256k1PublicKeyDer(privateKey);
+
+      // Serialize and sign the intent
+      const messageToSign = serializeIntentForSigning(
+        principal,
+        sourceChain,
+        sourceSymbol,
+        destChain,
+        destSymbol,
+        amountBaseUnits.toString(),
+        minOutputBaseUnits.toString(),
+        sequenceNumber.toString(),
+        intentDestAddress
+      );
+
+      // Hash the message first (secp256k1 expects 32-byte hash)
+      const msgHash = new Uint8Array(sha256.array(messageToSign));
+
+      // Sign (async) - v1.7.1
+      const signature = await secp256k1.sign(msgHash, privateKey, { der: false });
+      const signatureBytes = signature; // Already Uint8Array(64) in v1.7.1 with der: false
+
+      // Build the intent object
+      const intent = {
+        user: principal,
+        source_asset: { chain: { [sourceChain === 'ethereum' ? 'Ethereum' : 'Solana']: null }, symbol: { [sourceSymbol]: null } },
+        dest_asset: { chain: { [destChain === 'ethereum' ? 'Ethereum' : 'Solana']: null }, symbol: { [destSymbol]: null } },
+        dest_address: intentDestAddress,
+        amount: amountBaseUnits,
+        min_output: minOutputBaseUnits,
+        sequence_number: sequenceNumber,
+        public_key: Array.from(publicKeyDer),
+        signature: Array.from(signatureBytes),
+        signature_type: { Secp256k1: null }
+      };
+
+      // Call get_address_for_intent on the source chain canister
+      console.log(`Calling get_address_for_intent on ${sourceChain}...`);
+      const result = await sourceActor.get_address_for_intent(intent);
+
+      if (result && 'Ok' in result) {
+        setDepositAddress(result.Ok);
+        setSignedIntent(intent);
+        setIntentResult({ success: true, message: "Deposit Address Generated" });
+      } else {
+        setIntentResult({ success: false, error: formatCHError(result?.Err) || 'Failed to get deposit address' });
+      }
+    } catch (e) {
+      console.error("Error getting deposit address:", e);
+      setIntentResult({ success: false, error: e.message || 'Error occurred' });
+    } finally { setSubmittingIntent(false); }
+  }, [identity, matchingActor, ethActor, solActor, intentSourceAsset, intentDestAsset, intentAmount, intentMinOutput, intentDestAddress]);
+
+  const handleDeposit = useCallback(async () => {
+    if (!depositAddress || !intentAmount) return;
+    setDepositing(true);
+    setDepositTx(null);
+
+    try {
+      const principal = identity.getPrincipal(); // The user's principal
+      const [sourceChain, sourceSymbol] = intentSourceAsset.split(':');
+
+      const amountInBaseUnits = toBaseUnits(intentAmount, sourceSymbol, sourceChain);
+
+      let result;
+      if (sourceChain === 'ethereum') {
+        if (sourceSymbol === 'ETH') {
+          result = await ethActor.transfer_native(principal, depositAddress, amountInBaseUnits);
+        } else {
+          const symbol = { [sourceSymbol]: null };
+          result = await ethActor.transfer(symbol, principal, depositAddress, amountInBaseUnits);
+        }
+      } else { // Solana
+        if (sourceSymbol === 'SOL') {
+          result = await solActor.transfer_native(principal, depositAddress, amountInBaseUnits);
+        } else {
+          const symbol = { [sourceSymbol]: null };
+          result = await solActor.transfer(symbol, principal, depositAddress, amountInBaseUnits);
+        }
+      }
+
+      if (result && 'Ok' in result) {
+        setDepositTx(result.Ok);
+        setIntentResult({ success: true, message: "Deposit Initiated via Canister" });
+      } else {
+        setIntentResult({ success: false, error: formatCHError(result?.Err) || "Deposit failed" });
+      }
+    } catch (e) {
+      console.error("Deposit error:", e);
+      setIntentResult({ success: false, error: e.message || "Deposit failed" });
+    } finally {
+      setDepositing(false);
+    }
+  }, [intentSourceAsset, intentAmount, depositAddress, ethActor, solActor, identity]);
+
+  const handleFinalSubmitIntent = useCallback(async () => {
+    if (!signedIntent || !matchingActor) return;
+    setSubmittingIntent(true);
+    try {
+      const result = await matchingActor.submit_intent(signedIntent);
+      if (result && 'Ok' in result) {
+        setIntentResult({ success: true, orderId: result.Ok.toString() });
+      } else {
+        setIntentResult({ success: false, error: formatCHError(result?.Err) });
+      }
+    } catch (e) {
+      setIntentResult({ success: false, error: e.message });
+    } finally { setSubmittingIntent(false); }
+  }, [matchingActor, signedIntent]);
+
+  const handleCheckStatus = useCallback(async (id) => {
+    if (!matchingActor) return;
+    try {
+      const orderId = BigInt(id);
+      const orderOpt = await matchingActor.get_order(orderId);
+      if (orderOpt.length > 0) {
+        const order = orderOpt[0];
+        const statusKey = Object.keys(order.status)[0];
+        const statusVal = order.status[statusKey];
+        const statusStr = statusVal ? `${statusKey}: ${statusVal}` : statusKey;
+        setOrderStatus(statusStr);
+      } else {
+        setOrderStatus("NotFound");
+      }
+    } catch (e) {
+      console.error(e);
+      setOrderStatus("Error checking status");
+    }
+  }, [matchingActor]);
+
+  const handleCancelOrder = useCallback(async (id) => {
+    if (!matchingActor) return;
+    try {
+      const orderId = BigInt(id);
+      const result = await matchingActor.cancel_order(orderId);
+      if (result && 'Ok' in result) {
+        setOrderStatus("Cancelled");
+      } else {
+        alert("Cancel Failed: " + formatCHError(result?.Err));
+      }
+    } catch (e) {
+      alert("Cancel Error: " + e.message);
+    }
+  }, [matchingActor]);
+
+  // Update intent dest address when dest asset chain changes
+  useEffect(() => {
+    if (derivedInfo) {
+      const [destChain] = intentDestAsset.split(':');
+      setIntentDestAddress(destChain === 'ethereum' ? derivedInfo.ethAddress : derivedInfo.solAddress);
+    }
+  }, [intentDestAsset, derivedInfo]);
 
   const getExplorerTxUrl = (txHash, chain) => {
     if (chain === 'ethereum') return `https://sepolia.etherscan.io/tx/${txHash}`;
@@ -231,153 +527,340 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 font-sans">
       <div className="w-full max-w-2xl space-y-6">
         {/* Profile Selector */}
+        {/* Tab Selector */}
         <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-2xl overflow-hidden p-2 flex bg-slate-900/40">
-          {Object.values(PROFILES).map((profile) => (
-            <button key={profile.id} onClick={() => setSelectedProfile(profile.id)}
+          {TABS.map((tab) => (
+            <button key={tab.id} onClick={() => setSelectedTab(tab.id)}
               className={cn("flex-1 flex items-center justify-center gap-2 py-3 rounded-2xl transition-all font-medium text-sm",
-                selectedProfile === profile.id ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/25" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800")}>
-              {profile.id === 'custom' ? <Search className="w-4 h-4" /> : profile.id === 'seed' ? <Key className="w-4 h-4" /> : <User className="w-4 h-4" />}
-              {profile.name}
+                selectedTab === tab.id ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/25" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800")}>
+              <tab.icon className="w-4 h-4" />
+              {tab.name}
             </button>
           ))}
         </div>
 
         {/* Main Content */}
         <motion.div layout className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden">
-          <AnimatePresence mode="popLayout">
-            {(selectedProfile === 'custom' || selectedProfile === 'seed') && (
-              <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="p-8 border-b border-slate-700/50">
-                <div className="relative">
-                  <input type="text" value={inputValue} onChange={(e) => setInputValue(e.target.value)}
-                    placeholder={selectedProfile === 'seed' ? "Enter a seed string (e.g. Alice)..." : "Enter 0x... or Solana address..."}
-                    className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-slate-200"
-                    onKeyDown={(e) => e.key === 'Enter' && (selectedProfile === 'seed' ? handleSeedDerivation() : handleManualSubmit())} />
-                  {selectedProfile === 'seed' ? <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-indigo-400" /> : <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />}
-                  <button onClick={selectedProfile === 'seed' ? handleSeedDerivation : handleManualSubmit} disabled={loading || !inputValue}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50">
-                    {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
-                  </button>
+          <AnimatePresence mode="popLayout" initial={false}>
+            {selectedTab === 'orders' && (
+              <motion.div key="orders" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-bold text-slate-200 flex items-center gap-2"><RefreshCw className="w-5 h-5" /> My Orders</h3>
+                    <button onClick={fetchOrders} className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"><RefreshCw className="w-4 h-4" /></button>
+                  </div>
+                  {orders.length === 0 ? (
+                    <p className="text-slate-500 text-center py-8">No orders found.</p>
+                  ) : (
+                    <div className="space-y-3">
+                      {orders.map(order => {
+                        const statusKey = Object.keys(order.status)[0];
+                        const isLocked = statusKey === 'Locked';
+                        return (
+                          <div key={order.id.toString()} className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 flex items-center justify-between">
+                            <div>
+                              <div className="text-sm text-slate-300 font-mono">Order #{order.id.toString()}</div>
+                              <div className="text-xs text-slate-500 flex gap-2 mt-1">
+                                <span>{Number(order.intent.amount) / 1e6} {Object.keys(order.intent.source_asset.chain)[0]}:{Object.keys(order.intent.source_asset.symbol)[0]}</span>
+                                <ArrowRight className="w-3 h-3" />
+                                <span>{Object.keys(order.intent.dest_asset.chain)[0]}:{Object.keys(order.intent.dest_asset.symbol)[0]}</span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <span className={cn("text-xs px-2 py-1 rounded border",
+                                statusKey === 'Settled' ? "bg-green-500/10 text-green-400 border-green-500/20" :
+                                  statusKey === 'Cancelled' ? "bg-red-500/10 text-red-400 border-red-500/20" :
+                                    "bg-blue-500/10 text-blue-400 border-blue-500/20")}>
+                                {statusKey}
+                              </span>
+                              {isLocked && (
+                                <button onClick={() => handleCancelOrder(order.id)} className="p-2 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors" title="Cancel Order">
+                                  <XCircle className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
+            {selectedTab === 'connect' && (
+              <motion.div key="connect" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}>
+                <div className="p-8 border-b border-slate-700/50">
+                  <div className="relative">
+                    <input type="text" value={inputValue} onChange={(e) => setInputValue(e.target.value)}
+                      placeholder="Enter a seed string (e.g. Alice)..."
+                      className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 text-slate-200"
+                      onKeyDown={(e) => e.key === 'Enter' && handleSeedDerivation()} />
+                    <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-indigo-400" />
+                    <button onClick={handleSeedDerivation} disabled={loading || !inputValue}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50">
+                      {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
+                    </button>
+                  </div>
+
+                  {derivedInfo && (
+                    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mt-6 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-3">
+                      <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider">
+                        <ShieldCheck className="w-4 h-4" /> Deterministic Identity for "{derivedInfo.seed}"
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[10px] text-slate-500 font-bold uppercase">ICP Principal</span>
+                        <span className="text-xs font-mono text-slate-300 truncate">{derivedInfo.principal}</span>
+                      </div>
+                    </motion.div>
+                  )}
                 </div>
 
-                {derivedInfo && selectedProfile === 'seed' && (
-                  <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="mt-6 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-3">
-                    <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider">
-                      <ShieldCheck className="w-4 h-4" /> Deterministic Identity for "{derivedInfo.seed}"
+                {/* Results List */}
+                <div className="p-8 space-y-8">
+                  {loading && results.length === 0 && (
+                    <div className="flex flex-col items-center justify-center py-10 text-slate-500 space-y-4">
+                      <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" /><p>Fetching balances...</p>
                     </div>
-                    <div className="flex flex-col">
-                      <span className="text-[10px] text-slate-500 font-bold uppercase">ICP Principal</span>
-                      <span className="text-xs font-mono text-slate-300 truncate">{derivedInfo.principal}</span>
+                  )}
+                  <AnimatePresence mode="popLayout">
+                    {results.map((res, idx) => (
+                      <motion.div key={res.address} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.1 }} className="space-y-4">
+                        <div className="flex items-center justify-between pb-2 border-b border-slate-700/30">
+                          <div className="flex items-center gap-3">
+                            <div className={cn("w-2 h-2 rounded-full ring-4 ring-opacity-20", res.chainType === 'ethereum' ? 'bg-blue-400 ring-blue-400' : res.chainType === 'solana' ? 'bg-purple-400 ring-purple-400' : 'bg-slate-500 ring-slate-500')} />
+                            <div>
+                              <p className="text-sm font-mono text-slate-300 break-all">{res.address}</p>
+                              <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">{res.chainType === 'ethereum' ? 'Ethereum Sepolia' : res.chainType === 'solana' ? 'Solana Devnet' : 'Unknown Chain'}</p>
+                            </div>
+                          </div>
+                          <a href={res.chainType === 'ethereum' ? `https://sepolia.etherscan.io/address/${res.address}` : `https://explorer.solana.com/address/${res.address}?cluster=devnet`}
+                            target="_blank" rel="noopener noreferrer" className="p-2 hover:bg-slate-700/50 rounded-lg text-slate-400 hover:text-indigo-400 transition-colors">
+                            <ExternalLink className="w-4 h-4" />
+                          </a>
+                        </div>
+                        {res.error ? (
+                          <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-sm flex items-center gap-2"><AlertCircle className="w-4 h-4" /> {res.error}</div>
+                        ) : (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {res.balances.map((bal) => (
+                              <div key={bal.symbol} className="bg-slate-900/40 border border-slate-700/30 p-4 rounded-xl flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                  <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs", bal.isNative ? "bg-indigo-500/20 text-indigo-400" : "bg-slate-800 text-slate-400")}>{bal.symbol[0]}</div>
+                                  <span className="font-bold text-slate-200">{bal.symbol}</span>
+                                </div>
+                                <span className="font-mono text-slate-300">{parseFloat(bal.amount).toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+
+                </div>
+              </motion.div>
+            )}
+
+            {selectedTab === 'transfer' && derivedInfo && identity && (
+              <motion.div key="transfer" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                <div className="bg-slate-900/50 p-6 rounded-2xl border border-indigo-500/30 space-y-4">
+                  <div className="flex items-center gap-2 text-indigo-400 text-sm font-bold uppercase tracking-wider">
+                    <Send className="w-4 h-4" /> Transfer Tokens
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs text-slate-500 font-bold uppercase">Chain</label>
+                      <select value={transferChain} onChange={(e) => { setTransferChain(e.target.value); setTransferToken(e.target.value === 'ethereum' ? 'ETH' : 'SOL'); }}
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+                        {CHAINS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
                     </div>
-                  </motion.div>
-                )}
+                    <div>
+                      <label className="text-xs text-slate-500 font-bold uppercase">Token</label>
+                      <select value={transferToken} onChange={(e) => setTransferToken(e.target.value)}
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+                        {currentChainTokens.map(t => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="flex justify-between">
+                      <label className="text-xs text-slate-500 font-bold uppercase">Amount</label>
+                      <button onClick={() => {
+                        const chainRes = results.find(r => r.chainType === transferChain);
+                        if (chainRes) {
+                          const bal = chainRes.balances.find(b => b.symbol === transferToken);
+                          if (bal) setTransferAmount(bal.amount);
+                        }
+                      }} className="text-xs text-indigo-400 hover:text-indigo-300 font-bold uppercase">Max</button>
+                    </div>
+                    <input type="text" value={transferAmount} onChange={(e) => setTransferAmount(e.target.value)} placeholder="0.01"
+                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
+                    <input type="text" value={transferDest} onChange={(e) => setTransferDest(e.target.value)} placeholder={transferChain === 'ethereum' ? '0x...' : 'Solana address...'}
+                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
+                  </div>
+                  <button onClick={handleTransfer} disabled={transferring || !transferAmount || !transferDest}
+                    className="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2">
+                    {transferring ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting...</> : <><Send className="w-5 h-5" /> Send Transfer</>}
+                  </button>
+
+                  {transferResult && (
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                      className={cn("p-4 rounded-xl flex items-center gap-3", transferResult.success ? "bg-green-500/10 border border-green-500/30" : "bg-red-500/10 border border-red-500/30")}>
+                      {transferResult.success ? (
+                        <>
+                          <CheckCircle className="w-5 h-5 text-green-400" />
+                          <div className="flex-1">
+                            <p className="text-green-400 font-medium">Transfer Submitted!</p>
+                            <a href={getExplorerTxUrl(transferResult.txHash, transferResult.chain)} target="_blank" rel="noopener noreferrer"
+                              className="text-xs font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 mt-1">
+                              {transferResult.txHash.slice(0, 20)}... <ExternalLink className="w-3 h-3" />
+                            </a>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <AlertCircle className="w-5 h-5 text-red-400" />
+                          <p className="text-red-400">{transferResult.error}</p>
+                        </>
+                      )}
+                    </motion.div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
+            {selectedTab === 'swap' && derivedInfo && identity && matchingActor && (
+              <motion.div key="swap" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }} className="p-6">
+                <div className="bg-slate-900/50 p-6 rounded-2xl border border-emerald-500/30 space-y-4">
+                  <div className="flex items-center gap-2 text-emerald-400 text-sm font-bold uppercase tracking-wider">
+                    <Repeat className="w-4 h-4" /> Submit Swap Intent
+                  </div>
+                  {(() => {
+                    const solRes = results.find(r => r.chainType === 'solana');
+                    const solBal = solRes?.balances.find(b => b.symbol === 'SOL')?.amount;
+                    if (solBal && parseFloat(solBal) < 0.002) {
+                      return (
+                        <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-xl flex items-center gap-3">
+                          <AlertCircle className="w-4 h-4 text-yellow-500" />
+                          <p className="text-yellow-500 text-xs">
+                            Your SOL balance is low ({parseFloat(solBal).toFixed(4)} SOL). You need SOL to pay for transaction fees.
+                          </p>
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs text-slate-500 font-bold uppercase">Source Asset</label>
+                      <select value={intentSourceAsset} onChange={(e) => setIntentSourceAsset(e.target.value)}
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
+                        {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-bold uppercase">Destination Asset</label>
+                      <select value={intentDestAsset} onChange={(e) => setIntentDestAsset(e.target.value)}
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50">
+                        {INTENT_ASSETS.map(a => <option key={`${a.chain}:${a.symbol}`} value={`${a.chain}:${a.symbol}`}>{a.label}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <div className="flex justify-between">
+                        <label className="text-xs text-slate-500 font-bold uppercase">Amount (source)</label>
+                        <button onClick={() => {
+                          if (!intentSourceAsset) return;
+                          const [shouldBeChain, symbol] = intentSourceAsset.split(':');
+                          const chainType = shouldBeChain.toLowerCase();
+                          const chainRes = results.find(r => r.chainType === chainType);
+                          if (chainRes) {
+                            const bal = chainRes.balances.find(b => b.symbol === symbol);
+                            if (bal) setIntentAmount(bal.amount);
+                          }
+                        }} className="text-xs text-emerald-400 hover:text-emerald-300 font-bold uppercase">Max</button>
+                      </div>
+                      <input type="text" value={intentAmount} onChange={(e) => setIntentAmount(e.target.value)} placeholder="100.00"
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-500 font-bold uppercase">Min Output</label>
+                      <input type="text" value={intentMinOutput} onChange={(e) => setIntentMinOutput(e.target.value)} placeholder="99.00 (optional)"
+                        className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
+                    <input type="text" value={intentDestAddress} onChange={(e) => setIntentDestAddress(e.target.value)} placeholder="Destination address..."
+                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50" />
+                  </div>
+
+                  {/* Get Deposit Address Button */}
+                  <button onClick={handleGetDepositAddress} disabled={submittingIntent || !intentAmount || !intentDestAddress || !!depositAddress}
+                    className={cn("w-full py-3 text-white font-bold rounded-xl transition-all flex items-center justify-center gap-2",
+                      depositAddress ? "bg-slate-700 cursor-not-allowed opacity-75" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-500/20")}>
+                    {submittingIntent && !depositAddress ? <><RefreshCw className="w-5 h-5 animate-spin" /> Preparing Intent...</> :
+                      depositAddress ? <><CheckCircle className="w-5 h-5" /> Address Generated</> : <><Repeat className="w-5 h-5" /> Get Deposit Address</>}
+                  </button>
+
+                  {depositAddress && (
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl space-y-4">
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 text-emerald-400 font-medium">
+                          <CheckCircle className="w-4 h-4" /> Deposit Address Ready
+                        </div>
+                        <div className="bg-black/30 p-2 rounded text-slate-200 font-mono text-xs break-all select-all border border-emerald-500/10">
+                          {depositAddress}
+                        </div>
+                        <div className="text-xs text-slate-400 text-center">
+                          Send <b>{intentAmount} {intentSourceAsset.split(':')[1]}</b> to this address.
+                        </div>
+                      </div>
+
+                      <button onClick={handleDeposit} disabled={depositing || !!depositTx}
+                        className={cn("w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-bold shadow-lg",
+                          depositTx ? "bg-green-500/20 text-green-400 border border-green-500/30 cursor-default" : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/20")}>
+                        {depositing ? <RefreshCw className="w-4 h-4 animate-spin" /> :
+                          depositTx ? <><CheckCircle className="w-4 h-4" /> Deposit Executed</> :
+                            <><Send className="w-4 h-4" /> Execute Deposit</>}
+                      </button>
+
+                      {depositTx && (
+                        <div className="space-y-4 pt-4 border-t border-white/10 mt-4">
+                          <div className="flex items-center justify-center gap-2 text-indigo-400 text-sm">
+                            <ExternalLink className="w-4 h-4" />
+                            <a href={getExplorerTxUrl(depositTx, intentSourceAsset.split(':')[0])} target="_blank" rel="noreferrer" className="underline hover:text-indigo-300">
+                              View Deposit Transaction
+                            </a>
+                          </div>
+
+                          <button onClick={handleFinalSubmitIntent} disabled={submittingIntent || (intentResult?.success && intentResult?.orderId)}
+                            className={cn("w-full py-3 text-white font-bold rounded-xl transition-all shadow-lg flex items-center justify-center gap-2",
+                              (intentResult?.success && intentResult?.orderId) ? "bg-green-600 shadow-green-500/20 cursor-default" : "bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-500/20")}>
+                            {submittingIntent ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting Intent...</> :
+                              (intentResult?.success && intentResult?.orderId) ? <><CheckCircle className="w-5 h-5" /> Order submitted successfully</> : <><ShieldCheck className="w-5 h-5" /> Submit Final Intent</>}
+                          </button>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {intentResult && !intentResult.success && (
+                    <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-xl flex items-center gap-3 mt-4">
+                      <AlertCircle className="w-5 h-5 text-red-400" />
+                      <p className="text-red-400 text-sm">{intentResult.error}</p>
+                    </div>
+                  )}
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
-
-          {/* Results List */}
-          <div className="p-8 space-y-8">
-            {loading && results.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-10 text-slate-500 space-y-4">
-                <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" /><p>Fetching balances...</p>
-              </div>
-            )}
-            <AnimatePresence mode="popLayout">
-              {results.map((res, idx) => (
-                <motion.div key={res.address} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: idx * 0.1 }} className="space-y-4">
-                  <div className="flex items-center justify-between pb-2 border-b border-slate-700/30">
-                    <div className="flex items-center gap-3">
-                      <div className={cn("w-2 h-2 rounded-full ring-4 ring-opacity-20", res.chainType === 'ethereum' ? 'bg-blue-400 ring-blue-400' : res.chainType === 'solana' ? 'bg-purple-400 ring-purple-400' : 'bg-slate-500 ring-slate-500')} />
-                      <div>
-                        <p className="text-sm font-mono text-slate-300 break-all">{res.address}</p>
-                        <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">{res.chainType === 'ethereum' ? 'Ethereum Sepolia' : res.chainType === 'solana' ? 'Solana Devnet' : 'Unknown Chain'}</p>
-                      </div>
-                    </div>
-                    <a href={res.chainType === 'ethereum' ? `https://sepolia.etherscan.io/address/${res.address}` : `https://explorer.solana.com/address/${res.address}?cluster=devnet`}
-                      target="_blank" rel="noopener noreferrer" className="p-2 hover:bg-slate-700/50 rounded-lg text-slate-400 hover:text-indigo-400 transition-colors">
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
-                  </div>
-                  {res.error ? (
-                    <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-sm flex items-center gap-2"><AlertCircle className="w-4 h-4" /> {res.error}</div>
-                  ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                      {res.balances.map((bal) => (
-                        <div key={bal.symbol} className="bg-slate-900/40 border border-slate-700/30 p-4 rounded-xl flex items-center justify-between">
-                          <div className="flex items-center gap-3">
-                            <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs", bal.isNative ? "bg-indigo-500/20 text-indigo-400" : "bg-slate-800 text-slate-400")}>{bal.symbol[0]}</div>
-                            <span className="font-bold text-slate-200">{bal.symbol}</span>
-                          </div>
-                          <span className="font-mono text-slate-300">{parseFloat(bal.amount).toLocaleString(undefined, { maximumFractionDigits: 5 })}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </motion.div>
-              ))}
-            </AnimatePresence>
-
-            {/* Transfer Section */}
-            {derivedInfo && identity && (
-              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mt-8 p-6 bg-gradient-to-br from-indigo-900/30 to-purple-900/30 border border-indigo-500/30 rounded-2xl space-y-4">
-                <div className="flex items-center gap-2 text-indigo-400 text-sm font-bold uppercase tracking-wider">
-                  <Send className="w-4 h-4" /> Transfer Tokens
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-xs text-slate-500 font-bold uppercase">Chain</label>
-                    <select value={transferChain} onChange={(e) => { setTransferChain(e.target.value); setTransferToken(e.target.value === 'ethereum' ? 'ETH' : 'SOL'); }}
-                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
-                      {CHAINS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-slate-500 font-bold uppercase">Token</label>
-                    <select value={transferToken} onChange={(e) => setTransferToken(e.target.value)}
-                      className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
-                      {currentChainTokens.map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-slate-500 font-bold uppercase">Amount</label>
-                  <input type="text" value={transferAmount} onChange={(e) => setTransferAmount(e.target.value)} placeholder="0.01"
-                    className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
-                </div>
-                <div>
-                  <label className="text-xs text-slate-500 font-bold uppercase">Destination Address</label>
-                  <input type="text" value={transferDest} onChange={(e) => setTransferDest(e.target.value)} placeholder={transferChain === 'ethereum' ? '0x...' : 'Solana address...'}
-                    className="w-full mt-1 bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 text-slate-200 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50" />
-                </div>
-                <button onClick={handleTransfer} disabled={transferring || !transferAmount || !transferDest}
-                  className="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all disabled:opacity-50 flex items-center justify-center gap-2">
-                  {transferring ? <><RefreshCw className="w-5 h-5 animate-spin" /> Submitting...</> : <><Send className="w-5 h-5" /> Send Transfer</>}
-                </button>
-
-                {transferResult && (
-                  <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-                    className={cn("p-4 rounded-xl flex items-center gap-3", transferResult.success ? "bg-green-500/10 border border-green-500/30" : "bg-red-500/10 border border-red-500/30")}>
-                    {transferResult.success ? (
-                      <>
-                        <CheckCircle className="w-5 h-5 text-green-400" />
-                        <div className="flex-1">
-                          <p className="text-green-400 font-medium">Transfer Submitted!</p>
-                          <a href={getExplorerTxUrl(transferResult.txHash, transferResult.chain)} target="_blank" rel="noopener noreferrer"
-                            className="text-xs font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 mt-1">
-                            {transferResult.txHash.slice(0, 20)}... <ExternalLink className="w-3 h-3" />
-                          </a>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <AlertCircle className="w-5 h-5 text-red-400" />
-                        <p className="text-red-400">{transferResult.error}</p>
-                      </>
-                    )}
-                  </motion.div>
-                )}
-              </motion.div>
-            )}
-          </div>
         </motion.div>
       </div>
     </div>
