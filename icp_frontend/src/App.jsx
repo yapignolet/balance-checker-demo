@@ -1,9 +1,12 @@
 import { useState, useEffect } from 'react';
 import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, sepolia } from 'viem/chains';
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
+import { sha256 } from 'js-sha256';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Wallet, Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Users, User } from 'lucide-react';
+import { Wallet, Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import config from './config.json';
@@ -37,26 +40,58 @@ const PROFILES = {
       '0x78697a9cfc48C1e9d1040172d51833EF78083b10'
     ]
   },
+  seed: {
+    id: 'seed',
+    name: 'Connect Seed',
+    addresses: []
+  },
   custom: {
     id: 'custom',
-    name: 'Custom',
+    name: 'Manual',
     addresses: []
   }
 };
 
 export default function App() {
-  const [selectedProfile, setSelectedProfile] = useState('oisy'); // Default to Oisy
-  const [customAddress, setCustomAddress] = useState('');
+  const [selectedProfile, setSelectedProfile] = useState('seed'); // Default to Seed now
+  const [inputValue, setInputValue] = useState('Alice'); // Default seed
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [derivedInfo, setDerivedInfo] = useState(null);
 
   useEffect(() => {
-    if (selectedProfile !== 'custom') {
+    if (selectedProfile === 'oisy' || selectedProfile === 'alice') {
       checkBalances(PROFILES[selectedProfile].addresses);
+      setDerivedInfo(null);
+    } else if (selectedProfile === 'seed' && inputValue) {
+      handleSeedDerivation();
     } else {
       setResults([]);
+      setDerivedInfo(null);
     }
   }, [selectedProfile]);
+
+  const handleSeedDerivation = () => {
+    if (!inputValue) return;
+
+    // Deterministic Derivation
+    const hashHex = sha256(inputValue);
+    const seedBytes = new Uint8Array(sha256.array(inputValue));
+
+    // 1. ICP Principal
+    const icpId = Secp256k1KeyIdentity.fromSecretKey(seedBytes.buffer);
+    const principal = icpId.getPrincipal().toText();
+
+    // 2. Ethereum Address
+    const ethAccount = privateKeyToAccount(`0x${hashHex}`);
+
+    // 3. Solana Address
+    const solKeypair = Keypair.fromSeed(seedBytes);
+    const solAddress = solKeypair.publicKey.toBase58();
+
+    setDerivedInfo({ principal, ethAddress: ethAccount.address, solAddress, seed: inputValue });
+    checkBalances([ethAccount.address, solAddress]);
+  };
 
   const checkBalances = async (addressesToScan) => {
     if (!addressesToScan || addressesToScan.length === 0) return;
@@ -97,8 +132,8 @@ export default function App() {
     }
   };
 
-  const handleCustomSubmit = () => {
-    if (customAddress) checkBalances([customAddress]);
+  const handleManualSubmit = () => {
+    if (inputValue) checkBalances([inputValue]);
   };
 
   const fetchEthereumBalances = async (addr) => {
@@ -195,7 +230,8 @@ export default function App() {
                   : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
               )}
             >
-              {profile.id === 'custom' ? <Search className="w-4 h-4" /> : <User className="w-4 h-4" />}
+              {profile.id === 'custom' ? <Search className="w-4 h-4" /> :
+                profile.id === 'seed' ? <Key className="w-4 h-4" /> : <User className="w-4 h-4" />}
               {profile.name}
             </button>
           ))}
@@ -206,9 +242,9 @@ export default function App() {
           layout
           className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden"
         >
-          {/* Custom Input */}
+          {/* Input Area */}
           <AnimatePresence mode="popLayout">
-            {selectedProfile === 'custom' && (
+            {(selectedProfile === 'custom' || selectedProfile === 'seed') && (
               <motion.div
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: 'auto', opacity: 1 }}
@@ -218,21 +254,41 @@ export default function App() {
                 <div className="relative">
                   <input
                     type="text"
-                    value={customAddress}
-                    onChange={(e) => setCustomAddress(e.target.value)}
-                    placeholder="Enter Ethereum (0x...) or Solana address..."
+                    value={inputValue}
+                    onChange={(e) => setInputValue(e.target.value)}
+                    placeholder={selectedProfile === 'seed' ? "Enter a seed string (e.g. Alice)..." : "Enter 0x... or Solana address..."}
                     className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all text-slate-200"
-                    onKeyDown={(e) => e.key === 'Enter' && handleCustomSubmit()}
+                    onKeyDown={(e) => e.key === 'Enter' && (selectedProfile === 'seed' ? handleSeedDerivation() : handleManualSubmit())}
                   />
-                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
+                  {selectedProfile === 'seed' ? <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-indigo-400" /> : <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />}
                   <button
-                    onClick={handleCustomSubmit}
-                    disabled={loading || !customAddress}
+                    onClick={selectedProfile === 'seed' ? handleSeedDerivation : handleManualSubmit}
+                    disabled={loading || !inputValue}
                     className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50"
                   >
                     {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
                   </button>
                 </div>
+
+                {/* Identity Info Panel */}
+                {derivedInfo && selectedProfile === 'seed' && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-6 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-3"
+                  >
+                    <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider">
+                      <ShieldCheck className="w-4 h-4" />
+                      Deterministic Identity for "{derivedInfo.seed}"
+                    </div>
+                    <div className="grid grid-cols-1 gap-2">
+                      <div className="flex flex-col">
+                        <span className="text-[10px] text-slate-500 font-bold uppercase">ICP Principal</span>
+                        <span className="text-xs font-mono text-slate-300 truncate">{derivedInfo.principal}</span>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
@@ -243,12 +299,6 @@ export default function App() {
               <div className="flex flex-col items-center justify-center py-10 text-slate-500 space-y-4">
                 <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" />
                 <p>Fetching balances...</p>
-              </div>
-            )}
-
-            {!loading && results.length === 0 && selectedProfile === 'custom' && (
-              <div className="text-center py-10 text-slate-500">
-                Enter an address to get started
               </div>
             )}
 
