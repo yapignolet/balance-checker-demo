@@ -1,7 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { mainnet, sepolia } from 'viem/chains';
+import { sepolia } from 'viem/chains';
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { Secp256k1KeyIdentity } from '@dfinity/identity-secp256k1';
 import { sha256 } from 'js-sha256';
@@ -9,6 +8,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Wallet, Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Key, User, ShieldCheck } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { Actor, HttpAgent } from '@dfinity/agent';
+import { ethTransferIdl, solTransferIdl } from './idl';
 import config from './config.json';
 
 // Utility for Tailwind classes
@@ -59,41 +60,84 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [derivedInfo, setDerivedInfo] = useState(null);
 
-  useEffect(() => {
-    if (selectedProfile === 'oisy' || selectedProfile === 'alice') {
-      checkBalances(PROFILES[selectedProfile].addresses);
-      setDerivedInfo(null);
-    } else if (selectedProfile === 'seed' && inputValue) {
-      handleSeedDerivation();
-    } else {
-      setResults([]);
-      setDerivedInfo(null);
+  const fetchEthereumBalances = useCallback(async (addr) => {
+    const chainConfig = config.chains['sepolia'];
+    const client = createPublicClient({
+      chain: sepolia,
+      transport: http(chainConfig.rpc)
+    });
+
+    const balList = [];
+
+    // Native ETH
+    try {
+      const balance = await client.getBalance({ address: addr });
+      balList.push({
+        symbol: chainConfig.nativeToken.symbol,
+        amount: formatUnits(balance, chainConfig.nativeToken.decimals),
+        isNative: true
+      });
+    } catch (e) { console.error(e); }
+
+    // Tokens
+    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
+      try {
+        const balance = await client.readContract({
+          address: info.address,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [addr]
+        });
+        balList.push({
+          symbol: symbol,
+          amount: formatUnits(balance, info.decimals),
+          isNative: false
+        });
+      } catch {
+        balList.push({ symbol, amount: '0', isNative: false });
+      }
     }
-  }, [selectedProfile]);
+    return balList;
+  }, []);
 
-  const handleSeedDerivation = () => {
-    if (!inputValue) return;
+  const fetchSolanaBalances = useCallback(async (addr) => {
+    const chainConfig = config.chains['solana-devnet'];
+    const connection = new Connection(chainConfig.rpc, 'confirmed');
+    const pubKey = new PublicKey(addr);
+    const balList = [];
 
-    // Deterministic Derivation
-    const hashHex = sha256(inputValue);
-    const seedBytes = new Uint8Array(sha256.array(inputValue));
+    // Native SOL
+    try {
+      const balance = await connection.getBalance(pubKey);
+      balList.push({
+        symbol: chainConfig.nativeToken.symbol,
+        amount: (balance / Math.pow(10, chainConfig.nativeToken.decimals)).toString(),
+        isNative: true
+      });
+    } catch (e) { console.error(e); }
 
-    // 1. ICP Principal
-    const icpId = Secp256k1KeyIdentity.fromSecretKey(seedBytes.buffer);
-    const principal = icpId.getPrincipal().toText();
+    // SPL Tokens
+    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
+      try {
+        const mint = new PublicKey(info.address);
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(pubKey, { mint });
+        let total = 0;
+        for (const { account } of tokenAccounts.value) {
+          total += account.data.parsed.info.tokenAmount.uiAmount || 0;
+        }
+        balList.push({
+          symbol: symbol,
+          amount: total.toString(),
+          isNative: false
+        });
+      } catch {
+        balList.push({ symbol, amount: '0', isNative: false });
+      }
+    }
+    return balList;
+  }, []);
 
-    // 2. Ethereum Address
-    const ethAccount = privateKeyToAccount(`0x${hashHex}`);
-
-    // 3. Solana Address
-    const solKeypair = Keypair.fromSeed(seedBytes);
-    const solAddress = solKeypair.publicKey.toBase58();
-
-    setDerivedInfo({ principal, ethAddress: ethAccount.address, solAddress, seed: inputValue });
-    checkBalances([ethAccount.address, solAddress]);
-  };
-
-  const checkBalances = async (addressesToScan) => {
+  const checkBalances = useCallback(async (addressesToScan) => {
     if (!addressesToScan || addressesToScan.length === 0) return;
 
     setLoading(true);
@@ -130,91 +174,70 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [fetchEthereumBalances, fetchSolanaBalances]);
+
+  const handleSeedDerivation = useCallback(async () => {
+    if (!inputValue) return;
+    try {
+      setLoading(true);
+      // Deterministic Derivation
+      const seedBytes = new Uint8Array(sha256.array(inputValue));
+
+      // 1. ICP Principal
+      const icpId = Secp256k1KeyIdentity.fromSecretKey(seedBytes);
+      const principal = icpId.getPrincipal().toText();
+
+      // 2. Fetch Addresses from Canisters
+      const agent = new HttpAgent({ identity: icpId, host: "https://ic0.app" });
+
+      const ethCanisterId = config.chains['sepolia'].canisterId;
+      const solCanisterId = config.chains['solana-devnet'].canisterId;
+
+      const ethActor = Actor.createActor(ethTransferIdl, { agent, canisterId: ethCanisterId });
+      const solActor = Actor.createActor(solTransferIdl, { agent, canisterId: solCanisterId });
+
+      const [ethRes, solRes] = await Promise.all([
+        ethActor.get_eth_address(icpId.getPrincipal()),
+        solActor.get_sol_address(icpId.getPrincipal())
+      ]);
+
+      if (ethRes && 'Ok' in ethRes && solRes && 'Ok' in solRes) {
+        const ethAddress = ethRes.Ok;
+        const solAddress = solRes.Ok;
+        setDerivedInfo({ principal, ethAddress, solAddress, seed: inputValue });
+        checkBalances([ethAddress, solAddress]);
+      } else {
+        console.error("Failed to fetch address from canisters:", { ethRes, solRes });
+        setLoading(false);
+      }
+    } catch (e) {
+      console.error("Derivation error:", e);
+      setLoading(false);
+    }
+  }, [inputValue, checkBalances]);
+
+  useEffect(() => {
+    try {
+      if (selectedProfile === 'oisy' || selectedProfile === 'alice') {
+        checkBalances(PROFILES[selectedProfile].addresses);
+        setDerivedInfo(null);
+      } else if (selectedProfile === 'seed' && inputValue) {
+        handleSeedDerivation();
+      } else {
+        setResults([]);
+        setDerivedInfo(null);
+      }
+    } catch (e) {
+      console.error("Effect error:", e);
+    }
+  }, [selectedProfile, inputValue, checkBalances, handleSeedDerivation]);
 
   const handleManualSubmit = () => {
     if (inputValue) checkBalances([inputValue]);
   };
 
-  const fetchEthereumBalances = async (addr) => {
-    const chainConfig = config.chains['sepolia'];
-    const client = createPublicClient({
-      chain: sepolia,
-      transport: http(chainConfig.rpc)
-    });
-
-    const balList = [];
-
-    // Native ETH
-    try {
-      const balance = await client.getBalance({ address: addr });
-      balList.push({
-        symbol: chainConfig.nativeToken.symbol,
-        amount: formatUnits(balance, chainConfig.nativeToken.decimals),
-        isNative: true
-      });
-    } catch (e) { console.error(e); }
-
-    // Tokens
-    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
-      try {
-        const balance = await client.readContract({
-          address: info.address,
-          abi: erc20Abi,
-          functionName: 'balanceOf',
-          args: [addr]
-        });
-        balList.push({
-          symbol: symbol,
-          amount: formatUnits(balance, info.decimals),
-          isNative: false
-        });
-      } catch (e) {
-        balList.push({ symbol, amount: '0', isNative: false });
-      }
-    }
-    return balList;
-  };
-
-  const fetchSolanaBalances = async (addr) => {
-    const chainConfig = config.chains['solana-devnet'];
-    const connection = new Connection(chainConfig.rpc, 'confirmed');
-    const pubKey = new PublicKey(addr);
-    const balList = [];
-
-    // Native SOL
-    try {
-      const balance = await connection.getBalance(pubKey);
-      balList.push({
-        symbol: chainConfig.nativeToken.symbol,
-        amount: (balance / Math.pow(10, chainConfig.nativeToken.decimals)).toString(),
-        isNative: true
-      });
-    } catch (e) { console.error(e); }
-
-    // SPL Tokens
-    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
-      try {
-        const mint = new PublicKey(info.address);
-        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(pubKey, { mint });
-        let total = 0;
-        for (const { account } of tokenAccounts.value) {
-          total += account.data.parsed.info.tokenAmount.uiAmount || 0;
-        }
-        balList.push({
-          symbol: symbol,
-          amount: total.toString(),
-          isNative: false
-        });
-      } catch (e) {
-        balList.push({ symbol, amount: '0', isNative: false });
-      }
-    }
-    return balList;
-  };
-
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 text-white flex items-center justify-center p-4 font-sans">
+    <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 font-sans">
       <div className="w-full max-w-2xl space-y-6">
 
         {/* Header & Profile Selector */}

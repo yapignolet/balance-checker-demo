@@ -5,6 +5,7 @@
             "name": "Ethereum Sepolia Testnet",
             "rpc": "https://ethereum-sepolia-rpc.publicnode.com",
             "chainId": 11155111,
+            "canisterId": "blrpb-raaaa-aaaar-qb3kq-cai",
             "nativeToken": {
                 "symbol": "ETH",
                 "decimals": 18
@@ -24,6 +25,7 @@
             "type": "solana",
             "name": "Solana Devnet",
             "rpc": "https://api.devnet.solana.com",
+            "canisterId": "bcse5-hiaaa-aaaar-qb3la-cai",
             "nativeToken": {
                 "symbol": "SOL",
                 "decimals": 9

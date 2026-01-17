@@ -17,6 +17,8 @@ pub struct ChainConfig {
     pub rpc: String,
     #[serde(rename = "chainId", skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
+    #[serde(rename = "canisterId", skip_serializing_if = "Option::is_none")]
+    pub canister_id: Option<String>,
     #[serde(rename = "nativeToken")]
     pub native_token: TokenInfo,
     pub tokens: HashMap<String, TokenInfo>,
