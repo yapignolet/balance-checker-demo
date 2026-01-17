@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Wallet, Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink } from 'lucide-react';
+import { Wallet, Search, RefreshCw, AlertCircle, ArrowRight, ExternalLink, Users, User } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import config from './config.json';
@@ -20,45 +20,85 @@ const erc20Abi = parseAbi([
   'function symbol() view returns (string)'
 ]);
 
-export default function App() {
-  const [address, setAddress] = useState('');
-  const [balances, setBalances] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [chainType, setChainType] = useState(null);
+const PROFILES = {
+  oisy: {
+    id: 'oisy',
+    name: 'Oisy',
+    addresses: [
+      '2LmLQpWuTfhmc1GkMxsBphZnC9zN4qPutGWoCQw9Kgbi',
+      '0xd276501dBd43731C61ff775b21e80696c3c73645'
+    ]
+  },
+  alice: {
+    id: 'alice',
+    name: 'Alice',
+    addresses: [
+      '8vJ1EEeJBSX8UZetuHY7d2SiGjdw2AhfamzfxokPsCF4',
+      '0x78697a9cfc48C1e9d1040172d51833EF78083b10'
+    ]
+  },
+  custom: {
+    id: 'custom',
+    name: 'Custom',
+    addresses: []
+  }
+};
 
-  const checkBalances = async () => {
-    if (!address) return;
+export default function App() {
+  const [selectedProfile, setSelectedProfile] = useState('oisy'); // Default to Oisy
+  const [customAddress, setCustomAddress] = useState('');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (selectedProfile !== 'custom') {
+      checkBalances(PROFILES[selectedProfile].addresses);
+    } else {
+      setResults([]);
+    }
+  }, [selectedProfile]);
+
+  const checkBalances = async (addressesToScan) => {
+    if (!addressesToScan || addressesToScan.length === 0) return;
+
     setLoading(true);
-    setError(null);
-    setBalances([]);
-    setChainType(null);
+    setResults([]);
 
     try {
-      // 1. Detect Chain
-      let type = 'unknown';
-      if (address.startsWith('0x') && address.length === 42) {
-        type = 'ethereum';
-      } else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
-        type = 'solana';
-      } else {
-        throw new Error('Invalid address format. Use 0x... for Ethereum or Base58 for Solana.');
-      }
-      setChainType(type);
+      const promises = addressesToScan.map(async (addr) => {
+        // 1. Detect Chain
+        let type = 'unknown';
+        if (addr.startsWith('0x') && addr.length === 42) {
+          type = 'ethereum';
+        } else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) {
+          type = 'solana';
+        } else {
+          return { address: addr, error: 'Invalid address format', balances: [] };
+        }
 
-      // 2. Fetch Balances
-      if (type === 'ethereum') {
-        await fetchEthereumBalances(address);
-      } else {
-        await fetchSolanaBalances(address);
-      }
+        // 2. Fetch Balances
+        try {
+          const balances = type === 'ethereum'
+            ? await fetchEthereumBalances(addr)
+            : await fetchSolanaBalances(addr);
+          return { address: addr, chainType: type, balances };
+        } catch (err) {
+          return { address: addr, chainType: type, error: err.message || 'Fetch failed', balances: [] };
+        }
+      });
+
+      const data = await Promise.all(promises);
+      setResults(data);
 
     } catch (err) {
       console.error(err);
-      setError(err.message || 'Failed to fetch balances');
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleCustomSubmit = () => {
+    if (customAddress) checkBalances([customAddress]);
   };
 
   const fetchEthereumBalances = async (addr) => {
@@ -68,23 +108,20 @@ export default function App() {
       transport: http(chainConfig.rpc)
     });
 
-    const results = [];
+    const balList = [];
 
     // Native ETH
     try {
       const balance = await client.getBalance({ address: addr });
-      results.push({
+      balList.push({
         symbol: chainConfig.nativeToken.symbol,
         amount: formatUnits(balance, chainConfig.nativeToken.decimals),
         isNative: true
       });
-    } catch (e) {
-      console.error("Failed to fetch ETH balance", e);
-    }
+    } catch (e) { console.error(e); }
 
     // Tokens
-    const tokens = Object.entries(chainConfig.tokens);
-    for (const [symbol, info] of tokens) {
+    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
       try {
         const balance = await client.readContract({
           address: info.address,
@@ -92,186 +129,194 @@ export default function App() {
           functionName: 'balanceOf',
           args: [addr]
         });
-        results.push({
+        balList.push({
           symbol: symbol,
           amount: formatUnits(balance, info.decimals),
           isNative: false
         });
       } catch (e) {
-        console.warn(`Failed to fetch ${symbol}`, e);
-        // Add with 0 balance if failed
-        results.push({ symbol, amount: '0', isNative: false });
+        balList.push({ symbol, amount: '0', isNative: false });
       }
     }
-    setBalances(results);
+    return balList;
   };
 
   const fetchSolanaBalances = async (addr) => {
     const chainConfig = config.chains['solana-devnet'];
     const connection = new Connection(chainConfig.rpc, 'confirmed');
     const pubKey = new PublicKey(addr);
-    const results = [];
+    const balList = [];
 
     // Native SOL
     try {
       const balance = await connection.getBalance(pubKey);
-      results.push({
+      balList.push({
         symbol: chainConfig.nativeToken.symbol,
         amount: (balance / Math.pow(10, chainConfig.nativeToken.decimals)).toString(),
         isNative: true
       });
-    } catch (e) {
-      console.error("Failed to fetch SOL balance", e);
-    }
+    } catch (e) { console.error(e); }
 
     // SPL Tokens
-    const tokens = Object.entries(chainConfig.tokens);
-    for (const [symbol, info] of tokens) {
+    for (const [symbol, info] of Object.entries(chainConfig.tokens)) {
       try {
-        // Use getParsedTokenAccountsByOwner to match Logic (e.g. CLI)
-        // Note: config.json has token addresses
         const mint = new PublicKey(info.address);
         const tokenAccounts = await connection.getParsedTokenAccountsByOwner(pubKey, { mint });
-
         let total = 0;
         for (const { account } of tokenAccounts.value) {
-          const parsedInfo = account.data.parsed.info;
-          const amount = parsedInfo.tokenAmount.uiAmount || 0;
-          total += amount;
+          total += account.data.parsed.info.tokenAmount.uiAmount || 0;
         }
-
-        results.push({
+        balList.push({
           symbol: symbol,
           amount: total.toString(),
           isNative: false
         });
       } catch (e) {
-        console.warn(`Failed to fetch ${symbol}`, e);
-        results.push({ symbol, amount: '0', isNative: false });
+        balList.push({ symbol, amount: '0', isNative: false });
       }
     }
-    setBalances(results);
+    return balList;
   };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 text-white flex items-center justify-center p-4 font-sans">
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="w-full max-w-lg bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-2xl overflow-hidden"
-      >
-        {/* Header */}
-        <div className="p-8 border-b border-slate-700/50 bg-slate-800/30">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="p-2 bg-indigo-500/20 rounded-xl">
-              <Wallet className="w-6 h-6 text-indigo-400" />
-            </div>
-            <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">
-              Balance Checker
-            </h1>
-          </div>
-          <p className="text-slate-400 text-sm">
-            Enter an Ethereum or Solana address to view portfolio.
-          </p>
+      <div className="w-full max-w-2xl space-y-6">
+
+        {/* Header & Profile Selector */}
+        <div className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-2xl overflow-hidden p-2 flex p-2 bg-slate-900/40">
+          {Object.values(PROFILES).map((profile) => (
+            <button
+              key={profile.id}
+              onClick={() => setSelectedProfile(profile.id)}
+              className={cn(
+                "flex-1 flex items-center justify-center gap-2 py-3 rounded-2xl transition-all font-medium text-sm",
+                selectedProfile === profile.id
+                  ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/25"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
+              )}
+            >
+              {profile.id === 'custom' ? <Search className="w-4 h-4" /> : <User className="w-4 h-4" />}
+              {profile.name}
+            </button>
+          ))}
         </div>
 
-        {/* Input */}
-        <div className="p-8 space-y-6">
-          <div className="relative">
-            <input
-              type="text"
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              placeholder="0x... or 8vJ..."
-              className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all text-slate-200 placeholder-slate-500 font-mono text-sm"
-              onKeyDown={(e) => e.key === 'Enter' && checkBalances()}
-            />
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
-
-            <button
-              onClick={checkBalances}
-              disabled={loading || !address}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
-            </button>
-          </div>
-
-          {/* Error */}
-          <AnimatePresence>
-            {error && (
+        {/* Main Content Area */}
+        <motion.div
+          layout
+          className="bg-slate-800/50 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-xl overflow-hidden"
+        >
+          {/* Custom Input */}
+          <AnimatePresence mode="popLayout">
+            {selectedProfile === 'custom' && (
               <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="flex items-center gap-3 p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-sm"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                className="p-8 border-b border-slate-700/50"
               >
-                <AlertCircle className="w-5 h-5 shrink-0" />
-                <p>{error}</p>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={customAddress}
+                    onChange={(e) => setCustomAddress(e.target.value)}
+                    placeholder="Enter Ethereum (0x...) or Solana address..."
+                    className="w-full bg-slate-900/50 border border-slate-700 rounded-2xl px-5 py-4 pl-12 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all text-slate-200"
+                    onKeyDown={(e) => e.key === 'Enter' && handleCustomSubmit()}
+                  />
+                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
+                  <button
+                    onClick={handleCustomSubmit}
+                    disabled={loading || !customAddress}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors disabled:opacity-50"
+                  >
+                    {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
+                  </button>
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
 
-          {/* Results */}
-          <div className="space-y-3">
-            {chainType && !loading && !error && (
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <div className={cn("w-2 h-2 rounded-full", chainType === 'ethereum' ? 'bg-blue-400' : 'bg-purple-400')} />
-                  <span className="text-xs font-medium uppercase tracking-wider text-slate-500">
-                    {chainType === 'ethereum' ? 'Ethereum Sepolia' : 'Solana Devnet'}
-                  </span>
-                </div>
-                <a
-                  href={chainType === 'ethereum' ? `https://sepolia.etherscan.io/address/${address}` : `https://explorer.solana.com/address/${address}?cluster=devnet`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-                >
-                  <span>View explorer</span>
-                  <ExternalLink className="w-3 h-3" />
-                </a>
+          {/* Results List */}
+          <div className="p-8 space-y-8">
+            {loading && results.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-10 text-slate-500 space-y-4">
+                <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" />
+                <p>Fetching balances...</p>
+              </div>
+            )}
+
+            {!loading && results.length === 0 && selectedProfile === 'custom' && (
+              <div className="text-center py-10 text-slate-500">
+                Enter an address to get started
               </div>
             )}
 
             <AnimatePresence mode="popLayout">
-              {balances.map((balance, index) => (
+              {results.map((res, idx) => (
                 <motion.div
-                  key={balance.symbol}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: index * 0.1 }}
-                  className="group flex items-center justify-between p-4 bg-slate-900/30 hover:bg-slate-900/50 border border-slate-700/30 hover:border-indigo-500/30 rounded-2xl transition-all"
+                  key={res.address}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: idx * 0.1 }}
+                  className="space-y-4"
                 >
-                  <div className="flex items-center gap-3">
-                    <div className={cn(
-                      "w-10 h-10 rounded-xl flex items-center justify-center font-bold text-lg",
-                      balance.isNative ? "bg-indigo-500/20 text-indigo-400" : "bg-slate-800 text-slate-400"
-                    )}>
-                      {balance.symbol[0]}
+                  {/* Address Header */}
+                  <div className="flex items-center justify-between pb-2 border-b border-slate-700/30">
+                    <div className="flex items-center gap-3">
+                      <div className={cn("w-2 h-2 rounded-full ring-4 ring-opacity-20",
+                        res.chainType === 'ethereum' ? 'bg-blue-400 ring-blue-400' :
+                          res.chainType === 'solana' ? 'bg-purple-400 ring-purple-400' : 'bg-slate-500 ring-slate-500'
+                      )} />
+                      <div>
+                        <p className="text-sm font-mono text-slate-300 break-all">{res.address}</p>
+                        <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">
+                          {res.chainType === 'ethereum' ? 'Ethereum Sepolia' : res.chainType === 'solana' ? 'Solana Devnet' : 'Unknown Chain'}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="font-bold text-slate-200">{balance.symbol}</p>
-                      <p className="text-xs text-slate-500">{balance.isNative ? 'Native Token' : 'Token'}</p>
+                    <a
+                      href={res.chainType === 'ethereum'
+                        ? `https://sepolia.etherscan.io/address/${res.address}`
+                        : `https://explorer.solana.com/address/${res.address}?cluster=devnet`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-2 hover:bg-slate-700/50 rounded-lg text-slate-400 hover:text-indigo-400 transition-colors"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                    </a>
+                  </div>
+
+                  {/* Balances Grid */}
+                  {res.error ? (
+                    <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-sm flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4" /> {res.error}
                     </div>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-lg font-mono font-medium text-slate-200 tracking-tight">
-                      {parseFloat(balance.amount).toLocaleString(undefined, { maximumFractionDigits: 6 })}
-                    </p>
-                  </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {res.balances.map((bal) => (
+                        <div key={bal.symbol} className="bg-slate-900/40 border border-slate-700/30 p-4 rounded-xl flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs",
+                              bal.isNative ? "bg-indigo-500/20 text-indigo-400" : "bg-slate-800 text-slate-400"
+                            )}>
+                              {bal.symbol[0]}
+                            </div>
+                            <span className="font-bold text-slate-200">{bal.symbol}</span>
+                          </div>
+                          <span className="font-mono text-slate-300">
+                            {parseFloat(bal.amount).toLocaleString(undefined, { maximumFractionDigits: 5 })}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </motion.div>
               ))}
             </AnimatePresence>
-
-            {!loading && balances.length === 0 && !error && chainType && (
-              <div className="text-center py-10 text-slate-500">
-                <p>No balances found.</p>
-              </div>
-            )}
           </div>
-        </div>
-      </motion.div>
+        </motion.div>
+      </div>
     </div>
   );
 }
