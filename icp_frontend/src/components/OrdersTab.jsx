@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { RefreshCw, ArrowRight, XCircle } from 'lucide-react';
+import { RefreshCw, ArrowRight, XCircle, ExternalLink } from 'lucide-react';
 import { cn, CHAIN_ICONS } from '../constants';
 
 /**
@@ -89,6 +89,24 @@ export default function OrdersTab({ orders, showAllOrders, setShowAllOrders, fet
                                                 {Object.keys(order.intent.dest_asset.symbol)[0]}
                                             </span>
                                         </div>
+                                        {order.intent.dest_address && (() => {
+                                            const destChain = Object.keys(order.intent.dest_asset.chain)[0].toLowerCase();
+                                            const explorerUrl = destChain === 'ethereum'
+                                                ? `https://sepolia.etherscan.io/address/${order.intent.dest_address}`
+                                                : `https://explorer.solana.com/address/${order.intent.dest_address}?cluster=devnet`;
+                                            return (
+                                                <a
+                                                    href={explorerUrl}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    className="text-[10px] text-slate-500 hover:text-indigo-400 font-mono mt-1 flex items-center gap-1 transition-colors"
+                                                    title={order.intent.dest_address}
+                                                >
+                                                    → {order.intent.dest_address.slice(0, 8)}...{order.intent.dest_address.slice(-6)}
+                                                    <ExternalLink className="w-2.5 h-2.5" />
+                                                </a>
+                                            );
+                                        })()}
                                     </div>
 
                                     <div className="flex items-center gap-3">
