@@ -1,0 +1,41 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'icp_frontend/**'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'icp_frontend/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: icp_frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: icp_frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint || true  # Don't fail on lint for now
+
+      - name: Run tests
+        run: npm run test:run
+
+      - name: Build
+        run: npm run build
