@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Key, RefreshCw, ArrowRight, Check } from 'lucide-react';
 
 // Hooks
@@ -15,6 +15,7 @@ import BalancesDashboard from './components/BalancesDashboard';
 import OrdersTab from './components/OrdersTab';
 import TransferTab from './components/TransferTab';
 import SwapTab from './components/SwapTab';
+import AdminPanel from './components/AdminPanel';
 
 // Constants
 import { cn, TABS } from './constants';
@@ -42,7 +43,7 @@ export default function App() {
     matchingActor,
     handleSeedDerivation,
     loading
-  } = useIdentity(checkBalances, setIntentDestAddress);
+  } = useIdentity(checkBalances, null);
 
   const {
     orders,
@@ -51,13 +52,6 @@ export default function App() {
     fetchOrders,
     handleCancelOrder
   } = useOrders(matchingActor, identity, selectedTab, addToast);
-
-  // Auto-update intent dest address when derivedInfo changes
-  useEffect(() => {
-    if (derivedInfo) {
-      setIntentDestAddress(derivedInfo.solAddress);
-    }
-  }, [derivedInfo]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-4 font-sans">
@@ -183,6 +177,9 @@ export default function App() {
 
         {/* Toast Notifications */}
         <ToastContainer toasts={toasts} removeToast={removeToast} />
+
+        {/* Admin Panel */}
+        <AdminPanel />
       </div>
     </div>
   );
